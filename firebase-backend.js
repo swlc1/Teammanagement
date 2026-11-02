@@ -18,6 +18,7 @@
   const menus = {members:'team',projects:'projects',tasks:'tasks',schedules:'calendar',meetings:'meetings',kpis:'performance',leave:'leave',education:'education',documents:'documents',monthlyWork:'reports',counseling:'counseling'};
   let sdk, auth, firestore, storage, engine, userProfile, busy = false, ready = false;
   let unsubscribers = [], lastSettings = '', initializing = false, explicitLogin = false;
+  let deletedAccounts = [];
   const clone = v => JSON.parse(JSON.stringify(v));
   const localBackup = safeStorageGet('tmd-db');
   const status = document.createElement('div');
@@ -105,7 +106,7 @@
     ready = false;
     unsubscribers.forEach(fn => fn()); unsubscribers=[];
     engine?.close(); engine=null; userProfile=null;
-    currentUser=null; db=emptyDb();
+    currentUser=null; db=emptyDb();deletedAccounts=[];
     $('#content').innerHTML='';
     $('.search-results')?.remove();
     window.pendingPhotoData=null;window.pendingDocumentFileData=null;window.pendingMonthlyPdfData=null;
@@ -117,6 +118,12 @@
     closeModal();closeDrawer();updateStatus();
   }
   async function listen(collectionName, constraints=[]) {
+    // Rules allow these specific settings documents, not an unrestricted list.
+    // Read each permitted path so members never need collection-wide access.
+    if(collectionName==='settings') {
+      await Promise.all(settings.map(id=>listenSetting(id)));
+      return;
+    }
     const ref = sdk.query(sdk.collection(firestore,collectionName),...constraints);
     let initial = true;
     await new Promise((resolve,reject) => {
@@ -140,6 +147,21 @@
       unsubscribers.push(()=>{clearTimeout(timeout);unsubscribe();});
     });
   }
+  async function listenSetting(id) {
+    let initial=true;
+    await new Promise((resolve,reject)=>{
+      const timeout=setTimeout(()=>{if(initial){initial=false;reject({userMessage:'설정을 불러오는 중 응답이 지연되었습니다. 연결을 확인하고 다시 로그인해주세요.'});}},20000);
+      const unsubscribe=sdk.onSnapshot(sdk.doc(firestore,'settings',id),{includeMetadataChanges:true},snapshot=>{
+        if(snapshot.metadata.hasPendingWrites||snapshot.metadata.fromCache)return;
+        engine?.receive(`settings/${id}`,snapshot.exists()?snapshot.data():null);
+        if(initial){initial=false;clearTimeout(timeout);resolve();}
+      },error=>{
+        if(initial){initial=false;clearTimeout(timeout);reject(error);}
+        else{oldToast(errorMessage(error));void logout(true);}
+      });
+      unsubscribers.push(()=>{clearTimeout(timeout);unsubscribe();});
+    });
+  }
   async function enter(user) {
     if (busy) return; busy=true; initializing=true;
     try {
@@ -159,7 +181,9 @@
       if (canAdmin()) {
         const query = sdk.collection(firestore,'users');
         unsubscribers.push(sdk.onSnapshot(query,snapshot => {
-          db.userAccounts=snapshot.docs.map(d => ({...d.data(),id:d.id,username:d.data().email || (d.id===user.uid ? user.email : d.id)}));
+          const accounts=snapshot.docs.map(d => ({...d.data(),id:d.id,username:d.data().email || (d.id===user.uid ? user.email : d.id)}));
+          deletedAccounts=accounts.filter(a=>a.deleted===true);
+          db.userAccounts=accounts.filter(a=>a.deleted!==true);
           if (ready) render();
         }, e => oldToast(errorMessage(e))));
       } else db.userAccounts=[{...userProfile,id:user.uid,username:user.email}];
@@ -228,6 +252,7 @@
     const email=(input.email||'').trim().toLowerCase(),name=(input.name||'').trim(),role=input.role,memberId=input.memberId||null;
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw {userMessage:'실제 로그인 이메일을 입력해주세요.'};
     if(!name||!['admin','leader','member'].includes(role))throw {userMessage:'표시 이름과 권한을 확인해주세요.'};
+    if(!existing&&deletedAccounts.some(a=>(a.email||a.username||'').toLowerCase()===email))throw {userMessage:'삭제된 계정의 이메일입니다. 아래 삭제된 계정 목록에서 로그인 권한을 복구해주세요.'};
     if(role!=='admin'&&!db.members.some(m=>m.id===memberId))throw {userMessage:'연결할 팀원정보를 확인해주세요.'};
     if(db.userAccounts.some(x=>x.id!==accountId&&memberId&&x.memberId===memberId))throw {userMessage:'이미 계정이 생성된 팀원입니다.'};
     if(db.userAccounts.some(x=>x.id!==accountId&&(x.email||x.username||'').toLowerCase()===email))throw {userMessage:'이미 사용 중인 이메일입니다.'};
@@ -285,6 +310,28 @@
   }
   toggleUserAccount=id=>toggleAccount(id,'enabled');
   toggleAccountLock=id=>toggleAccount(id,'locked');
+  window.deleteLoginAccount=async function(id) {
+    if(!canAdmin())return oldToast('관리자만 로그인 계정을 삭제할 수 있습니다.');
+    if(id===currentUser.uid)return oldToast('현재 로그인한 관리자 계정은 삭제할 수 없습니다.');
+    const account=accountById(id);if(!account)return;
+    if(!confirm(`${account.username} 계정의 시스템 로그인 권한과 활성 팀원 연결을 삭제하시겠습니까?\n팀원정보와 기존 업무 기록은 유지합니다. Firebase 인증 계정 자체는 남으며 같은 이메일은 아래 삭제된 계정 목록에서 복구할 수 있습니다.`))return;
+    try {
+      await sdk.setDoc(sdk.doc(firestore,'users',id),{deleted:true,enabled:false,locked:true,deletedAt:new Date().toISOString()},{merge:true});
+      accountLog('계정삭제',account,'시스템 로그인 권한 삭제 · 업무 기록 보존');
+      oldToast('계정의 시스템 로그인 권한을 삭제했습니다.');
+    }catch(error){oldToast(errorMessage(error));}
+  };
+  window.restoreLoginAccount=async function(id) {
+    if(!canAdmin())return;
+    const account=deletedAccounts.find(a=>a.id===id);if(!account)return;
+    if(account.role!=='admin'&&!db.members.some(m=>m.id===account.memberId))return oldToast('연결된 팀원정보가 없습니다. 먼저 팀원정보를 복원해주세요.');
+    if(account.memberId&&db.userAccounts.some(a=>a.memberId===account.memberId))return oldToast('해당 팀원에게 이미 다른 로그인 계정이 있습니다.');
+    if(!confirm(`${account.username} 계정의 시스템 로그인 권한을 복구하시겠습니까? 기존 비밀번호를 그대로 사용하며 사용중지와 잠금이 해제됩니다.`))return;
+    try {
+      await sdk.setDoc(sdk.doc(firestore,'users',id),{deleted:false,enabled:true,locked:false,restoredAt:new Date().toISOString()},{merge:true});
+      accountLog('계정복구',account,'기존 인증 계정의 로그인 권한 복구');oldToast('로그인 권한을 복구했습니다.');
+    }catch(error){oldToast(errorMessage(error));}
+  };
   openPasswordReset=async function(id) {
     if (!canAdmin()) return;
     const a=accountById(id),email=a?.email||a?.username;
@@ -295,7 +342,18 @@
   };
   resetAccountPassword=async()=>false;
   const oldRenderAccounts=renderAccountManagement;
-  renderAccountManagement=function(){return oldRenderAccounts().replace('팀원별 로그인 아이디, 사용상태, 잠금 및 비밀번호를 관리합니다. 비밀번호는 Salt + SHA-256 해시로 저장됩니다.','관리자가 팀원 계정을 생성하고 표시 이름·권한·사용상태를 관리합니다. 비밀번호 변경은 재설정 메일을 사용합니다.').replaceAll('비밀번호 초기화','재설정 메일').replace('현재 비밀번호는 조회할 수 없으며 관리자도 새 비밀번호 설정 또는 초기화만 가능합니다.','현재 비밀번호는 조회할 수 없습니다. 초기 비밀번호는 계정 생성 시 설정하고 이후 변경은 재설정 메일을 사용합니다.');};
+  renderAccountManagement=function(){
+    let html=oldRenderAccounts().replace('팀원별 로그인 아이디, 사용상태, 잠금 및 비밀번호를 관리합니다. 비밀번호는 Salt + SHA-256 해시로 저장됩니다.','관리자가 팀원 계정을 생성하고 표시 이름·권한·사용상태를 관리합니다. 비밀번호 변경은 재설정 메일을 사용합니다.').replaceAll('비밀번호 초기화','재설정 메일').replace('현재 비밀번호는 조회할 수 없으며 관리자도 새 비밀번호 설정 또는 초기화만 가능합니다.','현재 비밀번호는 조회할 수 없습니다. 초기 비밀번호는 계정 생성 시 설정하고 이후 변경은 재설정 메일을 사용합니다.');
+    html=html.replace(/(<button\b[^>]*data-account-reset="([^"]+)"[^>]*>[\s\S]*?<\/button>)/g,(button,idAttribute,id)=>id===currentUser.uid?button:button+`<button class="secondary-mini" style="color:#bc4138" data-account-delete="${esc(id)}" title="시스템 로그인 권한 삭제">삭제</button>`);
+    html+=`<section class="panel settings-panel wide" style="margin-top:16px"><h3>삭제된 로그인 계정</h3><p>삭제는 이 시스템의 로그인 권한을 회수합니다. Firebase 인증 계정의 영구 삭제는 콘솔에서 처리해야 합니다. 같은 이메일을 다시 사용하려면 아래에서 복구하세요.</p>${deletedAccounts.map(a=>`<div class="account-admin-row"><div><b>${esc(a.name||'사용자')}</b><span>${esc(a.email||a.username||'')}</span></div><button class="secondary-btn" data-account-restore="${esc(a.id)}">로그인 권한 복구</button></div>`).join('')||'<p class="meta">삭제된 계정이 없습니다.</p>'}</section>`;
+    return html;
+  };
+  const oldBindAccounts=bindAccountManagement;
+  bindAccountManagement=function(){
+    oldBindAccounts();if(!canAdmin()||state.page!=='settings')return;
+    $$('[data-account-delete]').forEach(button=>button.onclick=()=>deleteLoginAccount(button.dataset.accountDelete));
+    $$('[data-account-restore]').forEach(button=>button.onclick=()=>restoreLoginAccount(button.dataset.accountRestore));
+  };
   const oldSettings=renderSettings;
   renderSettings=function(){return `<section class="panel" style="padding:18px;margin-bottom:18px"><h3>Firebase 데이터 관리</h3><p>업무 데이터는 서버에서 공유됩니다. 팀원 계정은 아래 로그인 계정 관리에서 생성합니다.</p><p><b>첨부파일 저장 미사용</b> · 사진·PDF·일반 첨부는 업로드하지 않습니다. 백업 복원 시 첨부파일 제외 여부를 먼저 확인합니다.</p><button class="secondary-btn" onclick="importLocalFirebaseData()">기존 PC 데이터 가져오기</button><p>가져오기는 최초 1회 빈 데이터베이스에서만 가능합니다. 기존 로그인 계정·비밀번호는 가져오지 않습니다.</p></section>`+oldSettings().replace('PC 간 데이터 백업·복원','서버 데이터 백업·복원').replace('현재 PC의 작성값·팀원·권한·업무·월 추진업무 데이터를 다른 PC로 그대로 옮길 수 있습니다.','서버 데이터의 JSON 백업을 내려받거나 백업 내용을 서버에 복원합니다. Authentication 계정과 첨부파일 원본은 별도 관리합니다.').replace('① 기존 PC에서 전체 데이터 백업 → ② JSON 파일 이동 → ③ 새 PC에서 이 HTML 실행 → ④ 관리자 로그인 → ⑤ 백업 데이터 복원','다른 PC에서는 같은 사이트에 로그인하면 서버 데이터를 불러옵니다. 복원은 모든 사용자에게 반영됩니다.').replace('Prototype 기본 역할','Firebase 계정 역할');};
   window.importLocalFirebaseData=async function(){
