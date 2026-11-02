@@ -10,6 +10,8 @@
     appId: '1:596969395876:web:adb4a52f170ead225cb831'
   };
   const cdn = 'https://www.gstatic.com/firebasejs/13.1.0/';
+  const STORAGE_ENABLED = false;
+  const fileDisabledMessage = '현재 첨부파일 저장을 사용하지 않습니다. 파일은 PC에 별도로 보관하고 내용을 직접 입력해주세요.';
   const oldToast = toast;
   const arrays = ['members','projects','tasks','schedules','meetings','kpis','leave','education','documents','monthlyWork','counseling','auditLogs','accountLogs'];
   const settings = ['platformName','menuConfig','memberOrder','memberMenuPermissions'];
@@ -25,6 +27,8 @@
   function errorMessage(e) {
     if (e?.message === 'CONFLICT') return '다른 사용자가 같은 항목을 변경했습니다. 미저장본을 내려받은 뒤 서버 데이터를 다시 불러오세요.';
     if (/permission-denied|PERMISSION_DENIED/.test(e?.code || e?.message || '')) return '접근 권한이 없습니다. Firestore 규칙과 users 권한 정보를 확인해주세요.';
+    if (/email-already-in-use/.test(e?.code || '')) return '이미 등록된 이메일입니다. 다른 이메일을 사용하거나 기존 계정의 비밀번호 재설정을 이용해주세요.';
+    if (/weak-password/.test(e?.code || '')) return '인증 서비스의 비밀번호 정책에 맞는 비밀번호를 입력해주세요.';
     if (/invalid-credential|wrong-password|user-not-found/.test(e?.code || '')) return '이메일 또는 비밀번호를 확인해주세요.';
     if (/too-many-requests/.test(e?.code || '')) return '로그인 요청이 많습니다. 잠시 후 다시 시도해주세요.';
     if (/network-request-failed|unavailable/.test(e?.code || '')) return '서버에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.';
@@ -215,24 +219,59 @@
     db.accountLogs.unshift({id:crypto.randomUUID(),actor:currentUser.name,action,username:account?.username||'',detail,at:new Date().toISOString()});save();
   };
   repairStoredData = function () {oldToast('서버 데이터는 로그인 화면에서 초기화하지 않습니다. 관리자에게 문의해주세요.');};
-  // Real account credentials stay in Authentication. The dashboard only links UID and role.
+  // Provision on an isolated in-memory Auth instance so the admin stays signed in.
+  saveUserAccount = async function(accountId='',values=null) {
+    if(!canAdmin())throw {userMessage:'관리자만 계정을 관리할 수 있습니다.'};
+    const existing=accountId?accountById(accountId):null;
+    if(accountId&&!existing)throw {userMessage:'수정할 계정을 찾을 수 없습니다.'};
+    const input=values||{email:$('#firebaseEmail').value,name:$('#firebaseName').value,role:$('#firebaseRole').value,memberId:$('#firebaseMember').value,password:$('#firebasePassword')?.value,confirmPassword:$('#firebasePasswordConfirm')?.value};
+    const email=(input.email||'').trim().toLowerCase(),name=(input.name||'').trim(),role=input.role,memberId=input.memberId||null;
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))throw {userMessage:'실제 로그인 이메일을 입력해주세요.'};
+    if(!name||!['admin','leader','member'].includes(role))throw {userMessage:'표시 이름과 권한을 확인해주세요.'};
+    if(role!=='admin'&&!db.members.some(m=>m.id===memberId))throw {userMessage:'연결할 팀원정보를 확인해주세요.'};
+    if(db.userAccounts.some(x=>x.id!==accountId&&memberId&&x.memberId===memberId))throw {userMessage:'이미 계정이 생성된 팀원입니다.'};
+    if(db.userAccounts.some(x=>x.id!==accountId&&(x.email||x.username||'').toLowerCase()===email))throw {userMessage:'이미 사용 중인 이메일입니다.'};
+    if(existing) {
+      if(email!==(existing.email||existing.username||'').toLowerCase())throw {userMessage:'로그인 이메일 변경에는 계정 소유자의 보안 인증이 필요합니다. 이 화면에서는 표시 이름과 권한을 수정할 수 있습니다.'};
+      if(accountId===currentUser.uid&&role!=='admin')throw {userMessage:'현재 관리자의 권한은 변경할 수 없습니다.'};
+      await sdk.setDoc(sdk.doc(firestore,'users',accountId),{email,name,role,memberId},{merge:true});
+      accountLog('계정수정',{username:email},'표시 이름·권한 수정');return true;
+    }
+    const password=input.password||'';
+    if(password.length<8)throw {userMessage:'초기 비밀번호는 8자 이상 입력해주세요.'};
+    if(password!==input.confirmPassword)throw {userMessage:'비밀번호 확인값이 일치하지 않습니다.'};
+    const adminUid=auth.currentUser?.uid;
+    let accountApp,accountAuth,createdUser,linked=false;
+    try {
+      accountApp=sdk.initializeApp(config,'account-provision-'+crypto.randomUUID());
+      accountAuth=sdk.getAuth(accountApp);
+      await sdk.setPersistence(accountAuth,sdk.inMemoryPersistence);
+      const credential=await sdk.createUserWithEmailAndPassword(accountAuth,email,password);
+      createdUser=credential.user;
+      if(auth.currentUser?.uid!==adminUid||!canAdmin())throw {userMessage:'관리자 세션이 변경되었습니다. 다시 로그인해주세요.'};
+      await sdk.setDoc(sdk.doc(firestore,'users',createdUser.uid),{email,name,role,memberId,enabled:true,locked:false,createdAt:new Date().toISOString()});
+      linked=true;
+      accountLog('계정생성',{username:email},'관리자 화면에서 생성');
+      return true;
+    } catch(error) {
+      if(createdUser&&!linked) {
+        try {await sdk.deleteUser(createdUser);}
+        catch(cleanupError) {throw {userMessage:'계정 인증은 생성됐지만 권한 등록과 자동 취소가 실패했습니다. 같은 이메일로 다시 생성하지 말고 관리자에게 복구를 요청해주세요.'};}
+      }
+      throw error;
+    } finally {
+      if(accountAuth)try{await sdk.signOut(accountAuth);}catch(error){}
+      if(accountApp)try{await sdk.deleteApp(accountApp);}catch(error){}
+    }
+  };
   openAccountEditor = function(accountId='',memberId='') {
     if (!canAdmin()) return;
-    const a=accountById(accountId);
-    const m=db.members.find(x=>x.id===(memberId||a?.memberId));
-    modal(a?'Firebase 계정 연결 수정':'Firebase 계정 연결',`<p>먼저 Firebase Authentication에서 이메일 계정을 만드세요. 생성된 사용자 UID를 입력하면 이 팀원과 연결됩니다.</p><div class="field"><label>사용자 UID</label><input class="input" id="firebaseUid" value="${esc(a?.id||'')}" ${a?'readonly':''}></div><div class="field"><label>로그인 이메일</label><input class="input" type="email" id="firebaseEmail" value="${esc(a?.email||a?.username||m?.email||'')}"></div><div class="field"><label>표시 이름</label><input class="input" id="firebaseName" value="${esc(a?.name||m?.name||'관리자')}"></div><div class="field"><label>권한</label><select class="input" id="firebaseRole">${['admin','leader','member'].map(r=>`<option value="${r}" ${r===(a?.role||(m?.role==='팀장'?'leader':'member'))?'selected':''}>${{admin:'관리자',leader:'팀장',member:'팀원'}[r]}</option>`).join('')}</select></div><input type="hidden" id="firebaseMember" value="${esc(m?.id||a?.memberId||'')}"><p>이메일 주소 변경은 Authentication에서도 별도로 처리해야 합니다. 비밀번호는 이 화면에 저장하지 않습니다.</p>`,`<button class="primary-btn" id="linkFirebaseAccount">저장</button>`);
+    const a=accountById(accountId),m=db.members.find(x=>x.id===(memberId||a?.memberId));
+    modal(a?'계정 수정':'계정 생성',`<p>${a?'표시 이름과 권한을 수정합니다.':'팀원의 이메일과 초기 비밀번호로 로그인 계정을 바로 만듭니다.'}</p><div class="field"><label>로그인 이메일</label><input class="input" type="email" id="firebaseEmail" value="${esc(a?.email||a?.username||m?.email||'')}" ${a?'readonly':''} autocomplete="off"></div>${a?'':`<div class="field"><label>초기 비밀번호</label><input class="input" type="password" id="firebasePassword" autocomplete="new-password" placeholder="8자 이상"></div><div class="field"><label>초기 비밀번호 확인</label><input class="input" type="password" id="firebasePasswordConfirm" autocomplete="new-password"></div>`}<div class="field"><label>표시 이름</label><input class="input" id="firebaseName" value="${esc(a?.name||m?.name||'관리자')}"></div><div class="field"><label>권한</label><select class="input" id="firebaseRole">${['admin','leader','member'].map(r=>`<option value="${r}" ${r===(a?.role||(m?.role==='팀장'?'leader':'member'))?'selected':''}>${{admin:'관리자',leader:'팀장',member:'팀원'}[r]}</option>`).join('')}</select></div><input type="hidden" id="firebaseMember" value="${esc(m?.id||a?.memberId||'')}"><p>비밀번호는 인증 서비스에서 관리하며 이 시스템의 업무 데이터에 저장하지 않습니다. 기존 비밀번호 변경은 재설정 메일을 사용합니다.${a?' 로그인 이메일 변경에는 계정 소유자의 보안 인증이 필요합니다.':''}</p><div id="firebaseAccountError" role="alert" style="color:#bc4138"></div>`,`<button class="primary-btn" id="linkFirebaseAccount">${a?'저장':'계정 생성'}</button>`);
     $('#linkFirebaseAccount').onclick=async()=>{
-      const button=$('#linkFirebaseAccount');button.disabled=true;
-      try {
-        const uid=$('#firebaseUid').value.trim(), email=$('#firebaseEmail').value.trim(), role=$('#firebaseRole').value, member=$('#firebaseMember').value||null;
-        if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid) || !email.includes('@')) throw {userMessage:'UID와 이메일을 확인해주세요.'};
-        if (role!=='admin'&&!member) throw {userMessage:'팀원정보에서 연결할 팀원을 선택해주세요.'};
-        if (uid===currentUser.uid && role!=='admin') throw {userMessage:'현재 관리자의 권한은 변경할 수 없습니다.'};
-        if (db.userAccounts.some(x=>x.id!==uid&&member&&x.memberId===member)) throw {userMessage:'이미 다른 계정과 연결된 팀원입니다.'};
-        if (!a && db.userAccounts.some(x=>x.id===uid)) throw {userMessage:'이미 연결된 UID입니다. 해당 계정을 수정해주세요.'};
-        await sdk.setDoc(sdk.doc(firestore,'users',uid),{email,name:$('#firebaseName').value.trim()||m?.name||'사용자',role,memberId:member,enabled:a?.enabled!==false,locked:!!a?.locked},{merge:true});
-        closeModal();oldToast('Firebase 계정 연결을 저장했습니다.');
-      } catch(e) {oldToast(errorMessage(e));button.disabled=false;}
+      const button=$('#linkFirebaseAccount');button.disabled=true;$('#firebaseAccountError').textContent='';
+      try {await saveUserAccount(a?.id||'');closeModal();oldToast(a?'계정정보를 수정했습니다.':'로그인 계정을 생성했습니다. 초기 비밀번호를 팀원에게 전달해주세요.');}
+      catch(e){$('#firebaseAccountError').textContent=errorMessage(e);button.disabled=false;}
     };
   };
   async function toggleAccount(id,field) {
@@ -254,18 +293,17 @@
     try {await sdk.sendPasswordResetEmail(auth,email);oldToast('비밀번호 재설정 메일을 요청했습니다.');}
     catch(e) {oldToast(errorMessage(e));}
   };
-  saveUserAccount=async()=>false;
   resetAccountPassword=async()=>false;
   const oldRenderAccounts=renderAccountManagement;
-  renderAccountManagement=function(){return oldRenderAccounts().replace('팀원별 로그인 아이디, 사용상태, 잠금 및 비밀번호를 관리합니다. 비밀번호는 Salt + SHA-256 해시로 저장됩니다.','Firebase 이메일 계정과 팀원정보를 연결합니다. 비밀번호는 Firebase Authentication에서 관리합니다.').replaceAll('계정 생성','계정 연결').replaceAll('비밀번호 초기화','재설정 메일');};
+  renderAccountManagement=function(){return oldRenderAccounts().replace('팀원별 로그인 아이디, 사용상태, 잠금 및 비밀번호를 관리합니다. 비밀번호는 Salt + SHA-256 해시로 저장됩니다.','관리자가 팀원 계정을 생성하고 표시 이름·권한·사용상태를 관리합니다. 비밀번호 변경은 재설정 메일을 사용합니다.').replaceAll('비밀번호 초기화','재설정 메일').replace('현재 비밀번호는 조회할 수 없으며 관리자도 새 비밀번호 설정 또는 초기화만 가능합니다.','현재 비밀번호는 조회할 수 없습니다. 초기 비밀번호는 계정 생성 시 설정하고 이후 변경은 재설정 메일을 사용합니다.');};
   const oldSettings=renderSettings;
-  renderSettings=function(){return `<section class="panel" style="padding:18px;margin-bottom:18px"><h3>Firebase 데이터 관리</h3><p>업무 데이터는 서버에서 공유됩니다. 계정은 Authentication 사용자 UID로 연결합니다.</p><button class="secondary-btn" onclick="importLocalFirebaseData()">기존 PC 데이터 가져오기</button><p>가져오기는 최초 1회 빈 데이터베이스에서만 가능합니다. 기존 로그인 계정·비밀번호는 가져오지 않습니다.</p></section>`+oldSettings().replace('PC 간 데이터 백업·복원','서버 데이터 백업·복원').replace('현재 PC의 작성값·팀원·권한·업무·월 추진업무 데이터를 다른 PC로 그대로 옮길 수 있습니다.','서버 데이터의 JSON 백업을 내려받거나 백업 내용을 서버에 복원합니다. Authentication 계정과 첨부파일 원본은 별도 관리합니다.').replace('① 기존 PC에서 전체 데이터 백업 → ② JSON 파일 이동 → ③ 새 PC에서 이 HTML 실행 → ④ 관리자 로그인 → ⑤ 백업 데이터 복원','다른 PC에서는 같은 사이트에 로그인하면 서버 데이터를 불러옵니다. 복원은 모든 사용자에게 반영됩니다.').replace('Prototype 기본 역할','Firebase 계정 역할');};
+  renderSettings=function(){return `<section class="panel" style="padding:18px;margin-bottom:18px"><h3>Firebase 데이터 관리</h3><p>업무 데이터는 서버에서 공유됩니다. 팀원 계정은 아래 로그인 계정 관리에서 생성합니다.</p><p><b>첨부파일 저장 미사용</b> · 사진·PDF·일반 첨부는 업로드하지 않습니다. 백업 복원 시 첨부파일 제외 여부를 먼저 확인합니다.</p><button class="secondary-btn" onclick="importLocalFirebaseData()">기존 PC 데이터 가져오기</button><p>가져오기는 최초 1회 빈 데이터베이스에서만 가능합니다. 기존 로그인 계정·비밀번호는 가져오지 않습니다.</p></section>`+oldSettings().replace('PC 간 데이터 백업·복원','서버 데이터 백업·복원').replace('현재 PC의 작성값·팀원·권한·업무·월 추진업무 데이터를 다른 PC로 그대로 옮길 수 있습니다.','서버 데이터의 JSON 백업을 내려받거나 백업 내용을 서버에 복원합니다. Authentication 계정과 첨부파일 원본은 별도 관리합니다.').replace('① 기존 PC에서 전체 데이터 백업 → ② JSON 파일 이동 → ③ 새 PC에서 이 HTML 실행 → ④ 관리자 로그인 → ⑤ 백업 데이터 복원','다른 PC에서는 같은 사이트에 로그인하면 서버 데이터를 불러옵니다. 복원은 모든 사용자에게 반영됩니다.').replace('Prototype 기본 역할','Firebase 계정 역할');};
   window.importLocalFirebaseData=async function(){
     if (!canAdmin()) return;
     if (!localBackup) return oldToast('이 브라우저에 기존 데이터가 없습니다. JSON 백업 파일을 복원할 수 있습니다.');
     if (arrays.some(k=>(db[k]||[]).length)) return oldToast('이미 서버 데이터가 있습니다. 중복 가져오기는 허용하지 않습니다.');
     if (!confirm('이 PC에 저장된 기존 데이터를 서버에 가져오시겠습니까? 예제 데이터가 포함되어 있을 수 있으니 먼저 확인해주세요.')) return;
-    try {await importData(JSON.parse(localBackup));oldToast('기존 데이터를 서버에 저장했습니다.');}catch(e){oldToast(errorMessage(e));}
+    try {const result=await importData(JSON.parse(localBackup));if(result)oldToast(`기존 데이터를 서버에 저장했습니다.${result.skipped?' 첨부파일 '+result.skipped+'건은 제외했습니다.':''}`);}catch(e){oldToast(errorMessage(e));}
   };
   renderers.settings=renderSettings;
   async function importData(source) {
@@ -273,6 +311,27 @@
     const clean=emptyDb();arrays.forEach(k=>clean[k]=clone(source[k]||[]));settings.forEach(k=>{if(source[k]!=null)clean[k]=clone(source[k]);});
     // Never put passwords, hashes or the old session into Firestore.
     clean.userAccounts=db.userAccounts;
+    if (!STORAGE_ENABLED) {
+      let skipped=0;
+      for (const item of clean.documents) {
+        if(item.fileData||item.filePath){skipped++;item.attachmentOmitted=true;}
+        delete item.fileData;delete item.filePath;
+      }
+      for (const member of clean.members) {
+        if(member.photo||member.photoPath){skipped++;member.photoOmitted=true;}
+        member.photo='';delete member.photoPath;
+      }
+      for (const report of clean.monthlyWork) {
+        if(report.pdfData||report.pdfPath){
+          skipped++;report.attachmentOmitted=true;report.originalAuthoringMode=report.authoringMode||'pdf';
+          report.authoringMode='direct';
+          if(!report.sections?.length)report.sections=[{category:'첨부파일 안내',content:'PDF 첨부는 복원에서 제외했습니다. 원본 백업 파일에 보관되어 있습니다.'}];
+        }
+        delete report.pdfData;delete report.pdfPath;
+      }
+      if(skipped && !confirm(`첨부파일 저장을 사용하지 않아 사진·PDF·일반 첨부 ${skipped}건을 제외하고 업무 데이터를 복원합니다. 제목과 파일명 등 메타데이터는 유지됩니다. 원본 백업 파일은 변경하지 않습니다. 계속하시겠습니까?`))return null;
+      db=clean;save();await engine.flush();renderNav();render();return {skipped};
+    }
     for (const item of clean.documents) {
       if (item.fileData) {const file=await (await fetch(item.fileData)).blob();item.filePath=await uploadFile(file,item.fileName||'document');delete item.fileData;}
     }
@@ -282,18 +341,19 @@
     for (const report of clean.monthlyWork) {
       if(report.pdfData?.startsWith('data:')) {const file=await(await fetch(report.pdfData)).blob();report.pdfPath=await uploadFile(file,report.pdfName||'report.pdf');report.pdfData=await sdk.getDownloadURL(sdk.ref(storage,report.pdfPath));}
     }
-    db=clean;save();await engine.flush();renderNav();render();
+    db=clean;save();await engine.flush();renderNav();render();return {skipped:0};
   }
   restoreDashboardBackup=async function(event){
     if (!canAdmin()) return;
     const file=event.target.files?.[0];if(!file)return;
     if (engine.pending.size) return oldToast('미저장 변경사항을 먼저 처리해주세요.');
     if (!confirm('공유 서버 데이터를 백업 내용으로 교체합니다. 다른 사용자에게도 반영됩니다. 먼저 현재 데이터를 백업했는지 확인해주세요. 계속하시겠습니까?')) return;
-    try {const payload=JSON.parse(await file.text());await importData(payload.format==='TMD_BACKUP'?payload.data:payload);oldToast('백업 내용을 서버에 저장했습니다.');}
+    try {const payload=JSON.parse(await file.text());const result=await importData(payload.format==='TMD_BACKUP'?payload.data:payload);if(result)oldToast(`백업 내용을 서버에 저장했습니다.${result.skipped?' 첨부파일 '+result.skipped+'건은 제외했습니다.':''}`);}
     catch(e){oldToast(errorMessage(e));}
   };
   dashboardBackupPayload=()=>({format:'TMD_BACKUP',version:'6-firebase',exportedAt:new Date().toISOString(),data:{...clone(db),userAccounts:[]}});
   async function uploadFile(file,name) {
+    if (!STORAGE_ENABLED) throw {userMessage:fileDisabledMessage};
     if (file.size>10*1024*1024) throw {userMessage:'첨부파일은 10MB 이하로 업로드해주세요.'};
     const path=`uploads/${auth.currentUser.uid}/${crypto.randomUUID()}-${name.replace(/[^A-Za-z0-9._가-힣-]/g,'_')}`;
     await sdk.uploadBytes(sdk.ref(storage,path),file);return path;
@@ -311,9 +371,23 @@
     }catch(e){oldToast(errorMessage(e));}
   };
   downloadDocumentFile=async function(id){
+    if (!STORAGE_ENABLED) return oldToast(fileDisabledMessage);
     const record=db.documents.find(d=>d.id===id);if(!record?.filePath)return oldToast('첨부파일이 없습니다.');
     try {const blob=await sdk.getBlob(sdk.ref(storage,record.filePath));const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=record.fileName||'download';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}catch(e){oldToast(errorMessage(e));}
   };
+  if (!STORAGE_ENABLED) {
+    const disabledPreview=event=>{if(event?.target)event.target.value='';oldToast(fileDisabledMessage);};
+    previewMemberPhoto=disabledPreview;previewDocumentFile=disabledPreview;previewMonthlyPdf=disabledPreview;
+    const oldOpenForm=openForm;
+    openForm=function(type,existing){
+      oldOpenForm(type,existing);
+      if(!['member','document','monthlyWork'].includes(type))return;
+      const box=$('#modal');if(!box)return;
+      box.querySelectorAll('input[type="file"]').forEach(input=>{input.disabled=true;});
+      box.querySelectorAll('input[name="monthlyAuthoringMode"][value="pdf"]').forEach(input=>{input.disabled=true;});
+      const note=document.createElement('p');note.textContent=fileDisabledMessage;note.style.cssText='padding:12px;color:#65747c;font-size:12px';box.appendChild(note);
+    };
+  }
   const oldSaveMember=saveMember;
   saveMember=async function(id='') {
     if (!canAdmin()) return oldToast('팀원정보와 직책은 관리자가 변경할 수 있습니다.');
@@ -341,9 +415,9 @@
   window.addEventListener('beforeunload',event=>{if(engine?.pending.size){event.preventDefault();event.returnValue='';}});
   window.addEventListener('online',()=>{if(engine?.pending.size)void engine.flush().catch(()=>{});});
   try {
-    const modules=await Promise.all(['app','auth','firestore','storage'].map(product=>import(cdn+`firebase-${product}.js`)));
+    const modules=await Promise.all((STORAGE_ENABLED?['app','auth','firestore','storage']:['app','auth','firestore']).map(product=>import(cdn+`firebase-${product}.js`)));
     sdk=Object.assign({},...modules);
-    const app=sdk.initializeApp(config);auth=sdk.getAuth(app);firestore=sdk.getFirestore(app);storage=sdk.getStorage(app);
+    const app=sdk.initializeApp(config);auth=sdk.getAuth(app);firestore=sdk.getFirestore(app);if(STORAGE_ENABLED)storage=sdk.getStorage(app);
     auth.languageCode='ko';await sdk.setPersistence(auth,sdk.browserSessionPersistence);
     // Fresh server data only. Keep legacy localStorage untouched for explicit migration.
     db=emptyDb();await init();
