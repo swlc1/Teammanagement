@@ -19,6 +19,39 @@
   let sdk, auth, firestore, storage, engine, userProfile, busy = false, ready = false;
   let unsubscribers = [], lastSettings = '', initializing = false, explicitLogin = false;
   let deletedAccounts = [];
+  let snapshotDepth=0;
+  let loadedCollections=new Set(),dataLoads=new Map(),loadErrors=new Map(),plannedCollections=[];
+  const pageCollections={home:['members','projects','tasks','schedules','leave'],tasks:['members','projects','tasks'],projects:['members','projects','tasks'],calendar:['members','projects','tasks','schedules','leave','education','meetings'],workload:['members','projects','tasks'],performance:['members','projects','tasks','kpis'],meetings:['members','projects','meetings'],reports:['members','monthlyWork'],analytics:['members','projects','tasks','kpis'],team:['members','tasks','education'],leave:['members','leave'],education:['members','education'],counseling:['members','counseling'],achievements:['members','projects','tasks'],documents:['members','projects','documents'],search:['members','projects','documents']};
+  function setAuthView(view,message='로그인 상태를 확인하고 있습니다.') {
+    document.documentElement.dataset.authState=view;
+    const text=document.getElementById('authLoadingMessage');if(text)text.textContent=message;
+  }
+  setAuthView('loading');
+  function neededForPage(page) {
+    return page==='settings'?plannedCollections:[...(pageCollections[page]||pageCollections.home)].filter(k=>plannedCollections.includes(k));
+  }
+  function loadCollection(name) {
+    if(dataLoads.has(name))return dataLoads.get(name);
+    const owner=engine;
+    const loading=(name==='users'?listenAccounts():listen(name)).then(()=>{
+      if(engine===owner){loadedCollections.add(name);loadErrors.delete(name);if(ready)render();updateStatus();}
+    }).catch(error=>{if(engine===owner){loadErrors.set(name,error);if(ready)render();updateStatus();}throw error;});
+    // Background requests always have an error handler, even if no page awaits them.
+    loading.catch(()=>{});dataLoads.set(name,loading);return loading;
+  }
+  const originalRender=render;
+  render=function(){
+    if(ready&&currentUser){
+      const required=neededForPage(state.page),missing=required.filter(k=>!loadedCollections.has(k));
+      if(missing.length){
+        const failed=missing.some(k=>loadErrors.has(k));
+        $('#content').innerHTML=`<div class="panel" role="status" style="padding:32px"><h3>${failed?'데이터를 불러오지 못했습니다.':'데이터를 불러오고 있습니다.'}</h3><p>${failed?'연결 상태를 확인하고 다시 로그인해주세요.':'화면에 필요한 데이터를 확인하고 있습니다. 잠시만 기다려주세요.'}</p></div>`;return;
+      }
+    }
+    originalRender();
+  };
+  const originalGo=go;
+  go=function(page){originalGo(page);if(currentUser&&canPage(state.page))safeStorageSet('tmd-last-page:'+currentUser.uid,state.page,'session');};
   const clone = v => JSON.parse(JSON.stringify(v));
   const localBackup = safeStorageGet('tmd-db');
   const status = document.createElement('div');
@@ -44,7 +77,8 @@
   function updateStatus() {
     status.replaceChildren();
     const label = document.createElement('span');
-    label.textContent = !ready ? '로그인 후 서버 데이터를 불러옵니다.' : engine?.error ? '미저장 변경사항이 있습니다. ' + errorMessage(engine.error) : engine?.pending.size ? `서버 저장 중 · ${engine.pending.size}건` : 'Firebase 연결됨 · 서버 저장 완료';
+    const remaining=plannedCollections.filter(k=>!loadedCollections.has(k)).length;
+    label.textContent = !ready ? '로그인 후 서버 데이터를 불러옵니다.' : engine?.error ? '미저장 변경사항이 있습니다. ' + errorMessage(engine.error) : engine?.pending.size ? `서버 저장 중 · ${engine.pending.size}건` : loadErrors.size ? '일부 데이터를 불러오지 못했습니다. 다시 로그인해주세요.' : remaining ? `Firebase 연결됨 · 나머지 데이터 불러오는 중 (${remaining})` : 'Firebase 연결됨 · 서버 저장 완료';
     status.appendChild(label);
     if (engine?.error) {
       const add = (text, action) => {const b=document.createElement('button');b.textContent=text;b.style.cssText='margin:6px 5px 0 0;padding:4px 8px;cursor:pointer';b.onclick=action;status.appendChild(b);};
@@ -70,6 +104,7 @@
     return result;
   }
   function rebuild() {
+    if(snapshotDepth)return;
     if (!engine || initializing) return updateStatus();
     const accounts = db.userAccounts || [];
     const next = emptyDb(); next.userAccounts = accounts;
@@ -107,6 +142,8 @@
     unsubscribers.forEach(fn => fn()); unsubscribers=[];
     engine?.close(); engine=null; userProfile=null;
     currentUser=null; db=emptyDb();deletedAccounts=[];
+    loadedCollections=new Set();dataLoads=new Map();loadErrors=new Map();plannedCollections=[];
+    setAuthView('signed-out');
     $('#content').innerHTML='';
     $('.search-results')?.remove();
     window.pendingPhotoData=null;window.pendingDocumentFileData=null;window.pendingMonthlyPdfData=null;
@@ -134,11 +171,12 @@
         // A cache snapshot can contain all document changes. The following server
         // snapshot may only change metadata and have an empty docChanges().
         // Populate a new session from the full authoritative result first.
-        if (initial) {
+        snapshotDepth++;
+        try {if (initial) {
           for (const document of snapshot.docs) engine?.receive(`${collectionName}/${document.id}`,document.data());
         } else {
           for (const change of snapshot.docChanges()) engine?.receive(`${collectionName}/${change.doc.id}`, change.type === 'removed' ? null : change.doc.data());
-        }
+        }}finally{snapshotDepth--;rebuild();}
         if (initial) {initial=false;clearTimeout(timeout);resolve();}
       }, error => {
         if (initial) {initial=false;clearTimeout(timeout);reject(error);}
@@ -162,8 +200,23 @@
       unsubscribers.push(()=>{clearTimeout(timeout);unsubscribe();});
     });
   }
+  async function listenAccounts() {
+    let initial=true;
+    await new Promise((resolve,reject)=>{
+      const timeout=setTimeout(()=>{if(initial){initial=false;reject({userMessage:'계정 목록을 불러오지 못했습니다. 연결을 확인해주세요.'});}},20000);
+      const unsubscribe=sdk.onSnapshot(sdk.collection(firestore,'users'),{includeMetadataChanges:true},snapshot=>{
+        if(snapshot.metadata.fromCache||snapshot.metadata.hasPendingWrites)return;
+        const accounts=snapshot.docs.map(d=>({...d.data(),id:d.id,username:d.data().email||(d.id===auth.currentUser?.uid?auth.currentUser.email:d.id)}));
+        deletedAccounts=accounts.filter(a=>a.deleted===true);db.userAccounts=accounts.filter(a=>a.deleted!==true);
+        if(initial){initial=false;clearTimeout(timeout);resolve();}
+        if(ready)render();
+      },error=>{if(initial){initial=false;clearTimeout(timeout);reject(error);}else{oldToast(errorMessage(error));void logout(true);}});
+      unsubscribers.push(()=>{clearTimeout(timeout);unsubscribe();});
+    });
+  }
   async function enter(user) {
     if (busy) return; busy=true; initializing=true;
+    setAuthView('loading','계정 권한과 화면 데이터를 확인하고 있습니다.');
     try {
       const profileSnap = await sdk.getDocFromServer(sdk.doc(firestore,'users',user.uid));
       if (!profileSnap.exists()) throw {userMessage:'등록된 권한 정보가 없습니다. 관리자에게 계정 연결을 요청해주세요.'};
@@ -177,16 +230,11 @@
       await listen('settings');
       initializing=false;rebuild();initializing=true;
       const plans=arrays.filter(k => k==='auditLogs' ? currentUser.role!=='member' : k==='accountLogs' ? canAdmin() : k==='counseling' ? canManage() : canPage(menus[k]));
-      await Promise.all(plans.map(k => listen(k)));
-      if (canAdmin()) {
-        const query = sdk.collection(firestore,'users');
-        unsubscribers.push(sdk.onSnapshot(query,snapshot => {
-          const accounts=snapshot.docs.map(d => ({...d.data(),id:d.id,username:d.data().email || (d.id===user.uid ? user.email : d.id)}));
-          deletedAccounts=accounts.filter(a=>a.deleted===true);
-          db.userAccounts=accounts.filter(a=>a.deleted!==true);
-          if (ready) render();
-        }, e => oldToast(errorMessage(e))));
-      } else db.userAccounts=[{...userProfile,id:user.uid,username:user.email}];
+      plannedCollections=canAdmin()?[...plans,'users']:plans;
+      const remembered=safeStorageGet('tmd-last-page:'+user.uid);
+      const destination=remembered&&renderers[remembered]&&canPage(remembered)?remembered:'home';
+      await Promise.all(neededForPage(destination).map(loadCollection));
+      if(!canAdmin())db.userAccounts=[{...userProfile,id:user.uid,username:user.email}];
       // The profile is authoritative; role and enable changes revoke the current UI session.
       unsubscribers.push(sdk.onSnapshot(sdk.doc(firestore,'users',user.uid),snap => {
         const p=snap.exists()?snap.data():null;
@@ -201,14 +249,19 @@
         engine.receive(`members/${currentUser.memberId}`,own.data());rebuild();
       }
       lastSettings=JSON.stringify(db.memberMenuPermissions?.[currentUser.memberId]||{});
-      ready=true; state.page='home';
+      ready=true; state.page=destination;
+      state.openNavGroup=navGroups.find(group=>group.items.some(item=>item[0]===state.page))?.title||state.openNavGroup;
       // Signing in only reads data. Missing defaults are persisted on an
       // explicit edit, never as a side effect of authentication.
       const screen=$('#loginScreen');screen.classList.add('hidden');screen.style.display='none';
       const shell=$('#appShell');shell.classList.remove('locked');shell.style.pointerEvents='';shell.style.filter='';
+      setAuthView('ready');
       $('#loginPw').value='';$('#loginError').textContent='';
       renderNav();render();updateSessionUI();updateStatus();
-      $('#breadcrumb').textContent='홈 대시보드';
+      $('#breadcrumb').textContent=pageLabel(state.page);
+      safeStorageSet('tmd-last-page:'+user.uid,state.page,'session');
+      // Nonessential menus and histories must not block authentication.
+      for(const name of plannedCollections)if(!dataLoads.has(name))void loadCollection(name).catch(error=>oldToast(errorMessage(error)));
     } catch (e) {clearSession();await sdk.signOut(auth);throw e;}
     finally {busy=false;initializing=false;}
   }
@@ -225,13 +278,16 @@
   };
   login = async function (email,password) {
     explicitLogin=true;
+    setAuthView('loading','로그인하고 있습니다.');
     try {const credential=await sdk.signInWithEmailAndPassword(auth,email.trim(),password);
       await enter(credential.user);return true;
-    } finally {explicitLogin=false;}
+    } catch(error){if(!ready)setAuthView('signed-out');throw error;}
+    finally {explicitLogin=false;}
   };
   logout = async function(force=false) {
     if (!force && engine?.pending.size && !confirm('서버에 저장하지 못한 변경사항이 있습니다. 미저장본을 내려받지 않고 로그아웃하시겠습니까?')) return;
     // End listeners before signOut so no old user's data survives.
+    if(currentUser)safeStorageRemove('tmd-last-page:'+currentUser.uid);
     clearSession();await sdk.signOut(auth);
   };
   audit = function(action,menu,target='') {
@@ -358,6 +414,7 @@
   renderSettings=function(){return `<section class="panel" style="padding:18px;margin-bottom:18px"><h3>Firebase 데이터 관리</h3><p>업무 데이터는 서버에서 공유됩니다. 팀원 계정은 아래 로그인 계정 관리에서 생성합니다.</p><p><b>첨부파일 저장 미사용</b> · 사진·PDF·일반 첨부는 업로드하지 않습니다. 백업 복원 시 첨부파일 제외 여부를 먼저 확인합니다.</p><button class="secondary-btn" onclick="importLocalFirebaseData()">기존 PC 데이터 가져오기</button><p>가져오기는 최초 1회 빈 데이터베이스에서만 가능합니다. 기존 로그인 계정·비밀번호는 가져오지 않습니다.</p></section>`+oldSettings().replace('PC 간 데이터 백업·복원','서버 데이터 백업·복원').replace('현재 PC의 작성값·팀원·권한·업무·월 추진업무 데이터를 다른 PC로 그대로 옮길 수 있습니다.','서버 데이터의 JSON 백업을 내려받거나 백업 내용을 서버에 복원합니다. Authentication 계정과 첨부파일 원본은 별도 관리합니다.').replace('① 기존 PC에서 전체 데이터 백업 → ② JSON 파일 이동 → ③ 새 PC에서 이 HTML 실행 → ④ 관리자 로그인 → ⑤ 백업 데이터 복원','다른 PC에서는 같은 사이트에 로그인하면 서버 데이터를 불러옵니다. 복원은 모든 사용자에게 반영됩니다.').replace('Prototype 기본 역할','Firebase 계정 역할');};
   window.importLocalFirebaseData=async function(){
     if (!canAdmin()) return;
+    try{await Promise.all([...dataLoads.values()]);}catch(error){return oldToast(errorMessage(error));}
     if (!localBackup) return oldToast('이 브라우저에 기존 데이터가 없습니다. JSON 백업 파일을 복원할 수 있습니다.');
     if (arrays.some(k=>(db[k]||[]).length)) return oldToast('이미 서버 데이터가 있습니다. 중복 가져오기는 허용하지 않습니다.');
     if (!confirm('이 PC에 저장된 기존 데이터를 서버에 가져오시겠습니까? 예제 데이터가 포함되어 있을 수 있으니 먼저 확인해주세요.')) return;
@@ -365,6 +422,7 @@
   };
   renderers.settings=renderSettings;
   async function importData(source) {
+    await Promise.all([...dataLoads.values()]);
     if (!Array.isArray(source.members)||!Array.isArray(source.tasks)) throw {userMessage:'올바른 대시보드 백업 파일이 아닙니다.'};
     const clean=emptyDb();arrays.forEach(k=>clean[k]=clone(source[k]||[]));settings.forEach(k=>{if(source[k]!=null)clean[k]=clone(source[k]);});
     // Never put passwords, hashes or the old session into Firestore.
@@ -493,11 +551,12 @@
       try {await sdk.sendPasswordResetEmail(auth,id.value.trim());$('#loginError').textContent='등록된 이메일의 재설정 안내를 확인해주세요.';}catch(e){$('#loginError').textContent=errorMessage(e);}
     };form.appendChild(reset);
     sdk.onAuthStateChanged(auth,user=>{
-      if (!user) {if(ready)clearSession();return;}
+      if (!user) {if(ready)clearSession();if(!explicitLogin&&!busy)setAuthView('signed-out');return;}
       if (!explicitLogin&&!busy&&!ready)void enter(user).catch(e=>$('#loginError').textContent=errorMessage(e));
     });
     updateStatus();
   } catch(e) {
+    setAuthView('signed-out');
     console.error('FIREBASE_INIT',e);status.textContent='Firebase 연결에 실패했습니다. 새로고침해주세요.';
     $('#loginError').textContent=errorMessage(e);
     $('#loginForm').onsubmit=event=>{event.preventDefault();$('#loginError').textContent='Firebase 연결 실패로 로그인할 수 없습니다. 새로고침해주세요.';};

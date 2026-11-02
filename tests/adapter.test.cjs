@@ -8,25 +8,29 @@ const root=path.resolve(__dirname,'..');
 function element(){
   return {style:{},dataset:{},value:'',textContent:'',innerHTML:'',children:[],childNodes:[],classList:{add(){},remove(){},toggle(){},contains(){return false;}},setAttribute(){},append(el){this.children.push(el);},appendChild(el){this.children.push(el);return el;},replaceChildren(){this.children=[];},querySelector(){return element();},querySelectorAll(){return [];},closest(){return null;},remove(){},focus(){},click(){},addEventListener(){}};
 }
-async function fixture(){
+async function fixture(options={}){
   const nodes=new Map();const get=s=>{if(!nodes.has(s))nodes.set(s,element());return nodes.get(s);};
   const document={readyState:'complete',body:element(),documentElement:element(),querySelector:get,querySelectorAll:()=>[],getElementById:id=>get('#'+id),createElement:element,addEventListener(){}};
+  const authViews=[];
+  document.documentElement.dataset=new Proxy({},{set(target,key,value){if(key==='authState')authViews.push(value);target[key]=value;return true;}});
   const storage=new Map();
-  const context=vm.createContext({document,console,Intl,Date,TextEncoder,Uint8Array,ArrayBuffer,URL,Blob,crypto:webcrypto,structuredClone,setTimeout,clearTimeout,setInterval,clearInterval,queueMicrotask,confirm:()=>true,location:{protocol:'http:'},localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},sessionStorage:{getItem:()=>null,setItem(){},removeItem(){}},matchMedia:()=>({matches:false}),addEventListener(){}});
+  const session=new Map(Object.entries(options.session||{}));
+  const context=vm.createContext({document,console,Intl,Date,TextEncoder,Uint8Array,ArrayBuffer,URL,Blob,crypto:webcrypto,structuredClone,setTimeout,clearTimeout,setInterval,clearInterval,queueMicrotask,confirm:()=>true,location:{protocol:'http:'},localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},sessionStorage:{getItem:k=>session.get(k)||null,setItem:(k,v)=>session.set(k,v),removeItem:k=>session.delete(k)},matchMedia:()=>({matches:false}),addEventListener(){}});
   vm.runInContext('window=globalThis;',context);
   const fake=fs.readFileSync(path.join(__dirname,'browser-smoke.cjs'),'utf8').split('const fake=`')[1].split('`;\nconst server=')[0];
   const names=[...fake.matchAll(/export (?:const|function) (\w+)/g)].map(m=>m[1]);
   const sdk=vm.runInContext('(function(){'+fake.replaceAll('export ','')+';return {'+names.join(',')+'};})()',context);
+  if(options.signedIn)sdk.getAuth(sdk.initializeApp({})).currentUser={uid:'admin-uid',email:'admin@example.org'};
   const loadedModules=[];
   context.__loadSdk=async(url)=>{loadedModules.push(url);return sdk;};
   const html=fs.readFileSync(path.join(root,'index.html'),'utf8');
   const script=html.slice(html.indexOf('<script>/*')+8,html.lastIndexOf('</script>\n<script src="sync-engine.js"'));
   vm.runInContext(script,context);
-  vm.runInContext(`let rendered='';render=function(){if(!currentUser)return;rendered=(renderers[state.page]||renderers.home)();};renderNav=function(){};updateSessionUI=function(){};`,context);
+  vm.runInContext(`let rendered='',renderCount=0;render=function(){if(!currentUser)return;renderCount++;rendered=(renderers[state.page]||renderers.home)();};renderNav=function(){};updateSessionUI=function(){};`,context);
   vm.runInContext(fs.readFileSync(path.join(root,'sync-engine.js'),'utf8'),context);
   await vm.runInContext(fs.readFileSync(path.join(root,'firebase-backend.js'),'utf8').replaceAll('import(','__loadSdk('),context);
   const run=source=>vm.runInContext(source,context);
-  return {run,sdk,context,get,loadedModules};
+  return {run,sdk,context,get,loadedModules,authViews,session};
 }
 test('adapter uses Firebase authentication, starts empty, saves records and renders remote updates',async()=>{
   const {run,get}=await fixture();
@@ -185,5 +189,36 @@ test('member login uses allowed individual settings reads without a settings lis
   assert.equal(run('db.platformName'),'서버 플랫폼');
   assert.equal(run("__mock.reads.includes('settings/*')"),false);
   for(const id of ['platformName','menuConfig','memberOrder','memberMenuPermissions'])assert.equal(run("__mock.reads.includes('settings/"+id+"')"),true);
+  await run('logout()');
+});
+test('restoring an authenticated session never shows login and returns to the previous page',async()=>{
+  const {run,authViews,session}=await fixture({signedIn:true,session:{'tmd-last-page:admin-uid':'reports'}});
+  for(let i=0;i<100&&run("document.documentElement.dataset.authState")!=='ready';i++)await new Promise(resolve=>setTimeout(resolve,2));
+  assert.equal(run("document.documentElement.dataset.authState"),'ready');
+  assert.equal(authViews.includes('signed-out'),false);
+  assert.equal(run('state.page'),'reports');
+  run("go('tasks')");assert.equal(session.get('tmd-last-page:admin-uid'),'tasks');
+  await run('logout()');assert.equal(session.has('tmd-last-page:admin-uid'),false);
+  assert.equal(run("document.documentElement.dataset.authState"),'signed-out');
+});
+test('login is usable before nonessential histories finish loading',async()=>{
+  const {run,get}=await fixture();
+  run("__mock.holdCollections=['auditLogs','accountLogs','documents'];");
+  await run("login('admin@example.org','test-password')");
+  assert.equal(run("document.documentElement.dataset.authState"),'ready');
+  assert.equal(get('#loginScreen').style.display,'none');
+  run("go('settings')");assert.ok(get('#content').innerHTML.includes('데이터를 불러오고 있습니다'));
+  run('__mock.holdCollections=[];__mock.notify();');
+  await new Promise(resolve=>setTimeout(resolve,10));
+  assert.ok(run('rendered').includes('관리자가 팀원 계정을 생성'));
+  await run('logout()');
+});
+test('a large remote snapshot renders once instead of once per record',async()=>{
+  const {run}=await fixture();await run("login('admin@example.org','test-password')");
+  await new Promise(resolve=>setTimeout(resolve,10));
+  run("for(let i=0;i<100;i++)__mock.records.set('tasks/bulk-'+i,{version:'v1',value:{id:'bulk-'+i,title:'원격 업무 '+i,status:'예정',progress:0,start:TODAY,due:TODAY}});");
+  const before=run('renderCount');run("__mock.notifyCollection('tasks')");
+  assert.equal(run('db.tasks.length'),100);
+  assert.equal(run('renderCount')-before,1);
   await run('logout()');
 });
