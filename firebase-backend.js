@@ -120,7 +120,14 @@
       const unsubscribe = sdk.onSnapshot(ref,{includeMetadataChanges:true}, snapshot => {
         // Transactions must be acknowledged before their new versions enter the baseline.
         if (snapshot.metadata.hasPendingWrites || snapshot.metadata.fromCache) return;
-        for (const change of snapshot.docChanges()) engine?.receive(`${collectionName}/${change.doc.id}`, change.type === 'removed' ? null : change.doc.data());
+        // A cache snapshot can contain all document changes. The following server
+        // snapshot may only change metadata and have an empty docChanges().
+        // Populate a new session from the full authoritative result first.
+        if (initial) {
+          for (const document of snapshot.docs) engine?.receive(`${collectionName}/${document.id}`,document.data());
+        } else {
+          for (const change of snapshot.docChanges()) engine?.receive(`${collectionName}/${change.doc.id}`, change.type === 'removed' ? null : change.doc.data());
+        }
         if (initial) {initial=false;clearTimeout(timeout);resolve();}
       }, error => {
         if (initial) {initial=false;clearTimeout(timeout);reject(error);}
@@ -167,7 +174,8 @@
       }
       lastSettings=JSON.stringify(db.memberMenuPermissions?.[currentUser.memberId]||{});
       ready=true; state.page='home';
-      if (canAdmin() && settings.some(k=>!engine.server.has(`settings/${k}`))) {save();await engine.flush();}
+      // Signing in only reads data. Missing defaults are persisted on an
+      // explicit edit, never as a side effect of authentication.
       const screen=$('#loginScreen');screen.classList.add('hidden');screen.style.display='none';
       const shell=$('#appShell');shell.classList.remove('locked');shell.style.pointerEvents='';shell.style.filter='';
       $('#loginPw').value='';$('#loginError').textContent='';
