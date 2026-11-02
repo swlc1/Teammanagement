@@ -56,8 +56,12 @@
   const localBackup = safeStorageGet('tmd-db');
   const status = document.createElement('div');
   status.id = 'firebaseStatus'; status.setAttribute('role','status');
-  status.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:5000;background:#102c46;color:white;padding:10px 14px;border-radius:8px;max-width:min(560px,95vw);font-size:12px;box-shadow:0 2px 12px #0003';
+  status.style.cssText = 'position:static;width:100%;box-sizing:border-box;margin-top:10px;padding:9px 2px 0;border-top:1px solid #ffffff24;color:#c9d6e2;font-size:10px;line-height:1.5;overflow-wrap:anywhere';
+  status.hidden=true;
   status.textContent = 'Firebase 연결 준비 중…'; document.body.appendChild(status);
+  const accountStyle=document.createElement('style');
+  accountStyle.textContent='.sidebar-footer{flex:0 0 auto;max-height:45vh;overflow-y:auto}.sidebar-password{width:100%;margin-top:8px;padding:8px;border:1px solid #ffffff24;border-radius:9px;background:#ffffff0e;color:#cfdae2;font-size:10px;cursor:pointer}.sidebar-password:hover{background:#ffffff1a}.sidebar.collapsed .sidebar-password{font-size:0}.sidebar.collapsed .sidebar-password:after{content:"PW";font-size:10px}.sidebar.collapsed #firebaseStatus>span{font-size:0}.sidebar.collapsed #firebaseStatus>span:before{content:"●";font-size:11px;color:#83cba2}.sidebar.collapsed #firebaseStatus[data-state="error"]>span:before{color:#ef9f94}.sidebar.collapsed #firebaseStatus button{display:none}';
+  (document.head||document.body).appendChild(accountStyle);
   function errorMessage(e) {
     if (e?.message === 'CONFLICT') return '다른 사용자가 같은 항목을 변경했습니다. 미저장본을 내려받은 뒤 서버 데이터를 다시 불러오세요.';
     if (/permission-denied|PERMISSION_DENIED/.test(e?.code || e?.message || '')) return '접근 권한이 없습니다. Firestore 규칙과 users 권한 정보를 확인해주세요.';
@@ -75,10 +79,12 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function updateStatus() {
+    status.hidden=!ready||!currentUser;
     status.replaceChildren();
     const label = document.createElement('span');
     const remaining=plannedCollections.filter(k=>!loadedCollections.has(k)).length;
     label.textContent = !ready ? '로그인 후 서버 데이터를 불러옵니다.' : engine?.error ? '미저장 변경사항이 있습니다. ' + errorMessage(engine.error) : engine?.pending.size ? `서버 저장 중 · ${engine.pending.size}건` : loadErrors.size ? '일부 데이터를 불러오지 못했습니다. 다시 로그인해주세요.' : remaining ? `Firebase 연결됨 · 나머지 데이터 불러오는 중 (${remaining})` : 'Firebase 연결됨 · 서버 저장 완료';
+    status.title=label.textContent;status.dataset.state=engine?.error||loadErrors.size?'error':remaining||engine?.pending.size?'loading':'ready';
     status.appendChild(label);
     if (engine?.error) {
       const add = (text, action) => {const b=document.createElement('button');b.textContent=text;b.style.cssText='margin:6px 5px 0 0;padding:4px 8px;cursor:pointer';b.onclick=action;status.appendChild(b);};
@@ -289,6 +295,51 @@
     // End listeners before signOut so no old user's data survives.
     if(currentUser)safeStorageRemove('tmd-last-page:'+currentUser.uid);
     clearSession();await sdk.signOut(auth);
+  };
+  window.changeOwnPassword=async function(currentPassword,newPassword,confirmation) {
+    const user=auth?.currentUser;
+    if(!ready||!currentUser||!user||user.uid!==currentUser.uid)throw {userMessage:'로그인한 본인 계정에서만 비밀번호를 변경할 수 있습니다.'};
+    if(!currentPassword)throw {userMessage:'현재 비밀번호를 입력해주세요.'};
+    if((newPassword||'').length<8)throw {userMessage:'새 비밀번호는 8자 이상 입력해주세요.'};
+    if(newPassword!==confirmation)throw {userMessage:'새 비밀번호 확인값이 일치하지 않습니다.'};
+    if(newPassword===currentPassword)throw {userMessage:'현재 비밀번호와 다른 새 비밀번호를 입력해주세요.'};
+    const credential=sdk.EmailAuthProvider.credential(user.email,currentPassword);
+    await sdk.reauthenticateWithCredential(user,credential);
+    if(auth.currentUser?.uid!==user.uid||currentUser?.uid!==user.uid)throw {userMessage:'로그인 상태가 변경되었습니다. 다시 로그인해주세요.'};
+    await sdk.updatePassword(user,newPassword);
+    return true;
+  };
+  window.openOwnPasswordChange=function() {
+    if(!ready||!currentUser)return;
+    modal('내 비밀번호 변경',`<p>${esc(currentUser.id)} 계정의 비밀번호를 변경합니다.</p><div class="field"><label>현재 비밀번호</label><input class="input" id="ownPasswordCurrent" type="password" autocomplete="current-password"></div><div class="field"><label>새 비밀번호</label><input class="input" id="ownPasswordNew" type="password" autocomplete="new-password" placeholder="8자 이상"></div><div class="field"><label>새 비밀번호 확인</label><input class="input" id="ownPasswordConfirm" type="password" autocomplete="new-password"></div><p id="ownPasswordError" role="alert" style="color:#bc4138"></p>`,`<button class="secondary-btn" id="ownPasswordCancel" type="button">취소</button><button class="primary-btn" id="ownPasswordSave" type="button">비밀번호 변경</button>`);
+    $('#ownPasswordCancel').onclick=()=>closeModal();
+    $('#ownPasswordSave').onclick=async()=>{
+      const button=$('#ownPasswordSave'),field=$('#ownPasswordCurrent');button.disabled=true;$('#ownPasswordError').textContent='';
+      try {
+        await changeOwnPassword(field.value,$('#ownPasswordNew').value,$('#ownPasswordConfirm').value);
+        if($('#ownPasswordCurrent')===field){field.value='';$('#ownPasswordNew').value='';$('#ownPasswordConfirm').value='';closeModal();}
+        oldToast('본인 계정의 비밀번호를 변경했습니다. 다음 로그인부터 새 비밀번호를 사용해주세요.');
+      }catch(error){
+        if($('#ownPasswordCurrent')===field){$('#ownPasswordError').textContent=/invalid-credential|wrong-password/.test(error?.code||'')?'현재 비밀번호를 확인해주세요.':errorMessage(error);field.value='';button.disabled=false;}
+      }
+    };
+  };
+  const originalSessionUI=updateSessionUI;
+  updateSessionUI=function(){
+    originalSessionUI();if(!currentUser)return;
+    const footer=$('.sidebar-footer');
+    if(footer){
+      const button=document.createElement('button');button.id='sidebarPasswordBtn';button.type='button';button.className='sidebar-password';button.textContent='내 비밀번호 변경';button.title='본인 비밀번호 변경';button.onclick=openOwnPasswordChange;
+      footer.insertBefore(button,$('#sidebarLogoutBtn'));
+      footer.appendChild(status);
+    }
+    const chip=$('#sessionChip'),openAccount=chip?.onclick;
+    if(chip&&openAccount)chip.onclick=function(event){
+      openAccount.call(this,event);
+      const box=$('#modal .account-action-box');if(!box)return;
+      const button=document.createElement('button');button.type='button';button.className='secondary-btn';button.style.cssText='width:100%;margin-bottom:8px';button.textContent='내 비밀번호 변경';button.onclick=openOwnPasswordChange;
+      box.insertBefore(button,$('#accountLogoutBtn'));
+    };
   };
   audit = function(action,menu,target='') {
     if (!ready || !canManage()) return;

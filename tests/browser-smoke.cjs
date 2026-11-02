@@ -35,8 +35,11 @@ export const createUserWithEmailAndPassword=async(auth,email,password)=>{if(auth
 export const deleteUser=async user=>authUsers.delete(user.email);
 export const onAuthStateChanged=(auth,cb)=>{authListeners.add(cb);queueMicrotask(()=>cb(auth.currentUser));return()=>authListeners.delete(cb);};
 export const sendPasswordResetEmail=async()=>{};
+export const EmailAuthProvider={credential:(email,password)=>({email,password})};
+export const reauthenticateWithCredential=async(user,credential)=>{if(user.email!==credential.email||credential.password!=='test-password')throw {code:'auth/invalid-credential'};window.__mock.reauthCalls.push(user.uid);};
+export const updatePassword=async(user,password)=>{window.__mock.passwordUpdates.push(user.uid);};
 export const ref=(storage,key)=>({key});export const uploadBytes=async()=>{};export const getDownloadURL=async(ref)=>'https://example.org/'+ref.key;export const getBlob=async()=>new Blob(['test']);
-window.__mock={records,notify,authUsers,secondary,reads:[],notifyCollection:name=>{for(const fire of listeners)if(fire.collection===name)fire();},put:(key,value)=>{records.set(key,{version:'remote-'+(++sequence),value});notify();}};
+window.__mock={records,notify,authUsers,secondary,reads:[],reauthCalls:[],passwordUpdates:[],notifyCollection:name=>{for(const fire of listeners)if(fire.collection===name)fire();},put:(key,value)=>{records.set(key,{version:'remote-'+(++sequence),value});notify();}};
 `;
 const server=http.createServer((req,res)=>{
  res.setHeader('Access-Control-Allow-Origin','*');
