@@ -144,3 +144,35 @@ test('member cannot provision accounts',async()=>{
   assert.equal(run('__mock.authUsers.size'),0);
   await run('logout()');
 });
+test('admin deletes and restores login access without deleting team or work records',async()=>{
+  const {run}=await fixture();await run("login('admin@example.org','test-password')");
+  run("__mock.put('members/u1',{id:'u1',name:'팀원',role:'팀원'});__mock.put('settings/memberOrder',['u1']);__mock.put('tasks/keep',{id:'keep',title:'보존할 업무',assignee:'u1',status:'예정',progress:0,start:TODAY,due:TODAY});");
+  const memberBefore=run("JSON.stringify(__mock.records.get('members/u1'))");
+  const taskBefore=run("JSON.stringify(__mock.records.get('tasks/keep'))");
+  await run("deleteLoginAccount('member-uid')");
+  assert.equal(run("__mock.records.get('users/member-uid').deleted"),true);
+  assert.equal(run("__mock.records.get('users/member-uid').enabled"),false);
+  assert.equal(run("db.userAccounts.some(a=>a.id==='member-uid')"),false);
+  assert.equal(run("JSON.stringify(__mock.records.get('members/u1'))"),memberBefore);
+  assert.equal(run("JSON.stringify(__mock.records.get('tasks/keep'))"),taskBefore);
+  assert.ok(run('renderAccountManagement()').includes('data-account-restore="member-uid"'));
+  assert.equal(run('renderAccountManagement()').includes('data-account-delete="admin-uid"'),false);
+  await run("restoreLoginAccount('member-uid')");
+  assert.equal(run("__mock.records.get('users/member-uid').deleted"),false);
+  assert.equal(run("db.userAccounts.some(a=>a.id==='member-uid')"),true);
+  assert.ok(run('renderAccountManagement()').includes('data-account-delete="member-uid"'));
+  await run("deleteLoginAccount('admin-uid')");
+  assert.equal(run("__mock.records.get('users/admin-uid').deleted"),undefined);
+  await new Promise(resolve=>setTimeout(resolve,20));await run('logout()');
+});
+test('canceling deletion or calling it as a team member does not alter access',async()=>{
+  const {run,context}=await fixture();await run("login('admin@example.org','test-password')");
+  run("__mock.put('members/u1',{id:'u1',name:'팀원',role:'팀원'});");
+  const before=run("JSON.stringify(__mock.records.get('users/member-uid'))");
+  context.confirm=()=>false;await run("deleteLoginAccount('member-uid')");
+  assert.equal(run("JSON.stringify(__mock.records.get('users/member-uid'))"),before);
+  await run('logout()');await run("login('member@example.org','test-password')");
+  await run("deleteLoginAccount('admin-uid')");
+  assert.equal(run("__mock.records.get('users/admin-uid').deleted"),undefined);
+  await run('logout()');
+});
