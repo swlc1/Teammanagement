@@ -23,8 +23,8 @@ export function onSnapshot(ref,options,next,error){
  if(typeof options==='function'){error=next;next=options;}
  window.__mock?.reads?.push(ref.key||ref.collection+'/*');
  let previous=new Set(),first=true;
- const fire=()=>{try{if(ref.collection==='settings'&&window.__mock?.denySettingsList){error?.({code:'permission-denied'});return;}if(ref.key){next(snap(ref.key));return;}const keys=[...records.keys()].filter(k=>k.startsWith(ref.collection+'/'));const docs=keys.map(k=>snap(k));const changes=keys.map(k=>({type:previous.has(k)?'modified':'added',doc:snap(k)}));for(const key of previous)if(!keys.includes(key))changes.push({type:'removed',doc:{id:key.split('/')[1]}});previous=new Set(keys);const cacheFirst=first&&window.__mock?.cacheFirst;first=false;if(cacheFirst)next({docs,metadata:{fromCache:true,hasPendingWrites:false},docChanges:()=>changes});next({docs,metadata:{fromCache:false,hasPendingWrites:false},docChanges:()=>cacheFirst?[]:changes});}catch(e){error?.(e);}};
- listeners.add(fire);queueMicrotask(fire);return()=>listeners.delete(fire);
+ const fire=()=>{try{if(window.__mock?.holdCollections?.includes(ref.collection))return;if(ref.collection==='settings'&&window.__mock?.denySettingsList){error?.({code:'permission-denied'});return;}if(ref.key){next(snap(ref.key));return;}const keys=[...records.keys()].filter(k=>k.startsWith(ref.collection+'/'));const docs=keys.map(k=>snap(k));const changes=keys.map(k=>({type:previous.has(k)?'modified':'added',doc:snap(k)}));for(const key of previous)if(!keys.includes(key))changes.push({type:'removed',doc:{id:key.split('/')[1]}});previous=new Set(keys);const cacheFirst=first&&window.__mock?.cacheFirst;first=false;if(cacheFirst)next({docs,metadata:{fromCache:true,hasPendingWrites:false},docChanges:()=>changes});next({docs,metadata:{fromCache:false,hasPendingWrites:false},docChanges:()=>cacheFirst?[]:changes});}catch(e){error?.(e);}};
+ fire.collection=ref.collection;listeners.add(fire);queueMicrotask(fire);return()=>listeners.delete(fire);
 }
 export const runTransaction=async(db,body)=>{const writes=[];const tx={get:async ref=>snap(ref.key),set:(ref,value)=>writes.push([ref.key,value]),delete:ref=>writes.push([ref.key,null])};await body(tx);for(const [key,value]of writes){if(value===null)records.delete(key);else records.set(key,structuredClone(value));}notify();};
 export const setDoc=async(ref,data)=>{if(window.__mock.failProfileWrite&&ref.key.startsWith("users/created-"))throw {code:"permission-denied"};records.set(ref.key,{...records.get(ref.key),...data});notify();};
@@ -36,7 +36,7 @@ export const deleteUser=async user=>authUsers.delete(user.email);
 export const onAuthStateChanged=(auth,cb)=>{authListeners.add(cb);queueMicrotask(()=>cb(auth.currentUser));return()=>authListeners.delete(cb);};
 export const sendPasswordResetEmail=async()=>{};
 export const ref=(storage,key)=>({key});export const uploadBytes=async()=>{};export const getDownloadURL=async(ref)=>'https://example.org/'+ref.key;export const getBlob=async()=>new Blob(['test']);
-window.__mock={records,notify,authUsers,secondary,reads:[],put:(key,value)=>{records.set(key,{version:'remote-'+(++sequence),value});notify();}};
+window.__mock={records,notify,authUsers,secondary,reads:[],notifyCollection:name=>{for(const fire of listeners)if(fire.collection===name)fire();},put:(key,value)=>{records.set(key,{version:'remote-'+(++sequence),value});notify();}};
 `;
 const server=http.createServer((req,res)=>{
  res.setHeader('Access-Control-Allow-Origin','*');
