@@ -118,6 +118,12 @@
     closeModal();closeDrawer();updateStatus();
   }
   async function listen(collectionName, constraints=[]) {
+    // Rules allow these specific settings documents, not an unrestricted list.
+    // Read each permitted path so members never need collection-wide access.
+    if(collectionName==='settings') {
+      await Promise.all(settings.map(id=>listenSetting(id)));
+      return;
+    }
     const ref = sdk.query(sdk.collection(firestore,collectionName),...constraints);
     let initial = true;
     await new Promise((resolve,reject) => {
@@ -137,6 +143,21 @@
       }, error => {
         if (initial) {initial=false;clearTimeout(timeout);reject(error);}
         else {oldToast(errorMessage(error));void logout(true);}
+      });
+      unsubscribers.push(()=>{clearTimeout(timeout);unsubscribe();});
+    });
+  }
+  async function listenSetting(id) {
+    let initial=true;
+    await new Promise((resolve,reject)=>{
+      const timeout=setTimeout(()=>{if(initial){initial=false;reject({userMessage:'설정을 불러오는 중 응답이 지연되었습니다. 연결을 확인하고 다시 로그인해주세요.'});}},20000);
+      const unsubscribe=sdk.onSnapshot(sdk.doc(firestore,'settings',id),{includeMetadataChanges:true},snapshot=>{
+        if(snapshot.metadata.hasPendingWrites||snapshot.metadata.fromCache)return;
+        engine?.receive(`settings/${id}`,snapshot.exists()?snapshot.data():null);
+        if(initial){initial=false;clearTimeout(timeout);resolve();}
+      },error=>{
+        if(initial){initial=false;clearTimeout(timeout);reject(error);}
+        else{oldToast(errorMessage(error));void logout(true);}
       });
       unsubscribers.push(()=>{clearTimeout(timeout);unsubscribe();});
     });

@@ -176,3 +176,14 @@ test('canceling deletion or calling it as a team member does not alter access',a
   assert.equal(run("__mock.records.get('users/admin-uid').deleted"),undefined);
   await run('logout()');
 });
+
+test('member login uses allowed individual settings reads without a settings list query',async()=>{
+  const {run}=await fixture();
+  run("__mock.denySettingsList=true;__mock.put('members/u1',{id:'u1',name:'팀원',role:'팀원'});__mock.put('settings/platformName','서버 플랫폼');");
+  await run("login('member@example.org','test-password')");
+  assert.equal(run('currentUser.role'),'member');
+  assert.equal(run('db.platformName'),'서버 플랫폼');
+  assert.equal(run("__mock.reads.includes('settings/*')"),false);
+  for(const id of ['platformName','menuConfig','memberOrder','memberMenuPermissions'])assert.equal(run("__mock.reads.includes('settings/"+id+"')"),true);
+  await run('logout()');
+});
