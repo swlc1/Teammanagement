@@ -21,8 +21,8 @@ export const getDocFromServer=async(ref)=>snap(ref.key);
 function notify(){for(const callback of listeners)callback();}
 export function onSnapshot(ref,options,next,error){
  if(typeof options==='function'){error=next;next=options;}
- let previous=new Set();
- const fire=()=>{try{if(ref.key){next(snap(ref.key));return;}const keys=[...records.keys()].filter(k=>k.startsWith(ref.collection+'/'));const docs=keys.map(k=>snap(k));const changes=keys.map(k=>({type:previous.has(k)?'modified':'added',doc:snap(k)}));for(const key of previous)if(!keys.includes(key))changes.push({type:'removed',doc:{id:key.split('/')[1]}});previous=new Set(keys);next({docs,metadata:{fromCache:false,hasPendingWrites:false},docChanges:()=>changes});}catch(e){error?.(e);}};
+ let previous=new Set(),first=true;
+ const fire=()=>{try{if(ref.key){next(snap(ref.key));return;}const keys=[...records.keys()].filter(k=>k.startsWith(ref.collection+'/'));const docs=keys.map(k=>snap(k));const changes=keys.map(k=>({type:previous.has(k)?'modified':'added',doc:snap(k)}));for(const key of previous)if(!keys.includes(key))changes.push({type:'removed',doc:{id:key.split('/')[1]}});previous=new Set(keys);const cacheFirst=first&&window.__mock?.cacheFirst;first=false;if(cacheFirst)next({docs,metadata:{fromCache:true,hasPendingWrites:false},docChanges:()=>changes});next({docs,metadata:{fromCache:false,hasPendingWrites:false},docChanges:()=>cacheFirst?[]:changes});}catch(e){error?.(e);}};
  listeners.add(fire);queueMicrotask(fire);return()=>listeners.delete(fire);
 }
 export const runTransaction=async(db,body)=>{const writes=[];const tx={get:async ref=>snap(ref.key),set:(ref,value)=>writes.push([ref.key,value]),delete:ref=>writes.push([ref.key,null])};await body(tx);for(const [key,value]of writes){if(value===null)records.delete(key);else records.set(key,structuredClone(value));}notify();};
@@ -59,7 +59,7 @@ const server=http.createServer((req,res)=>{
   await page.waitForFunction(()=>document.querySelector('#loginScreen').style.display==='none');
   await page.waitForFunction(()=>document.querySelector('#firebaseStatus').textContent.includes('서버 저장 완료'));
   assert.equal(await page.evaluate(()=>db.tasks.length),0,'no demo data auto-uploaded');
-  assert.equal(await page.evaluate(()=>[...window.__mock.records.keys()].filter(k=>k.startsWith('settings/')).length),4);
+  assert.equal(await page.evaluate(()=>[...window.__mock.records.keys()].filter(k=>k.startsWith('settings/')).length),0);
   await page.evaluate(()=>{db.members.push({id:'u1',name:'테스트 팀원',role:'팀원',rank:'연구원'});db.tasks.push({id:'t1',title:'공유 업무',assignee:'u1',projectId:null,status:'진행중',priority:'보통',progress:0,start:TODAY,due:TODAY});save();});
   await page.waitForFunction(()=>window.__mock.records.has('tasks/t1'));
   await page.evaluate(()=>go('tasks'));

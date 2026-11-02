@@ -6,7 +6,7 @@ const path=require('node:path');
 const {webcrypto}=require('node:crypto');
 const root=path.resolve(__dirname,'..');
 function element(){
-  return {style:{},dataset:{},value:'',textContent:'',innerHTML:'',children:[],childNodes:[],classList:{add(){},remove(){},toggle(){},contains(){return false;}},setAttribute(){},appendChild(el){this.children.push(el);return el;},replaceChildren(){this.children=[];},querySelector(){return element();},querySelectorAll(){return [];},closest(){return null;},remove(){},focus(){},click(){},addEventListener(){}};
+  return {style:{},dataset:{},value:'',textContent:'',innerHTML:'',children:[],childNodes:[],classList:{add(){},remove(){},toggle(){},contains(){return false;}},setAttribute(){},append(el){this.children.push(el);},appendChild(el){this.children.push(el);return el;},replaceChildren(){this.children=[];},querySelector(){return element();},querySelectorAll(){return [];},closest(){return null;},remove(){},focus(){},click(){},addEventListener(){}};
 }
 async function fixture(){
   const nodes=new Map();const get=s=>{if(!nodes.has(s))nodes.set(s,element());return nodes.get(s);};
@@ -36,7 +36,7 @@ test('adapter uses Firebase authentication, starts empty, saves records and rend
   assert.equal(run('currentUser.role'),'admin');
   assert.equal(get('#loginScreen').style.display,'none');
   assert.equal(run('db.tasks.length'),0);
-  assert.equal(run("[...__mock.records.keys()].filter(k=>k.startsWith('settings/')).length"),4);
+  assert.equal(run("[...__mock.records.keys()].filter(k=>k.startsWith('settings/')).length"),0,'login must not write defaults');
   run("Object.entries(renderers).forEach(([page,view])=>{if(canPage(page)){state.page=page;view();}});state.page='home';");
   run("db.members.push({id:'u1',name:'테스트 팀원',role:'팀원',rank:'연구원'});db.tasks.push({id:'t1',title:'공유 업무',assignee:'u1',status:'진행중',progress:0,start:TODAY,due:TODAY,priority:'보통'});save();");
   await new Promise(resolve=>setTimeout(resolve,20));
@@ -56,4 +56,19 @@ test('missing profile fails closed without exposing dashboard data',async()=>{
   await assert.rejects(run("login('member@example.org','test-password')"));
   assert.equal(run('currentUser'),null);assert.equal(get('#loginScreen').style.display,'grid');
   assert.equal(run('db.tasks.length'),0);
+});
+
+test('login after cached snapshots reads existing server data without rewriting it',async()=>{
+  const {run}=await fixture();
+  run("__mock.cacheFirst=true;__mock.records.set('settings/platformName',{version:'existing-config',value:'서버 플랫폼명'});__mock.records.set('tasks/existing',{version:'existing-task',value:{id:'existing',title:'기존 서버 업무',status:'예정',progress:0,start:TODAY,due:TODAY,priority:'보통'}});");
+  await run("login('admin@example.org','test-password')");
+  assert.equal(run('db.platformName'),'서버 플랫폼명');
+  assert.equal(run('db.tasks[0].title'),'기존 서버 업무');
+  assert.equal(run("__mock.records.get('settings/platformName').version"),'existing-config');
+  assert.equal(run("[...__mock.records.keys()].filter(k=>k.startsWith('settings/')).length"),1);
+  await run('logout()');
+  await run("login('admin@example.org','test-password')");
+  assert.equal(run('db.tasks[0].title'),'기존 서버 업무');
+  assert.equal(run("__mock.records.get('settings/platformName').version"),'existing-config');
+  await run('logout()');
 });
