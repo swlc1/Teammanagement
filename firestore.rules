@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function active() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && profile().enabled == true && profile().get('locked', false) == false
+        && profile().role in ['admin', 'leader', 'member'];
+    }
+    function admin() { return active() && profile().role == 'admin'; }
+    function manager() { return active() && profile().role in ['admin', 'leader']; }
+    function permission(menu, kind) {
+      let defaults = kind == 'view'
+        ? menu in ['home','tasks','projects','calendar','workload','team','leave','education','achievements','documents','references','templates','search','notifications']
+        : menu in ['tasks','leave','education','achievements'];
+      let configured = exists(/databases/$(database)/documents/settings/memberMenuPermissions)
+        ? get(/databases/$(database)/documents/settings/memberMenuPermissions).data.value
+        : {};
+      return configured.get(profile().get('memberId',''), {}).get(menu, {}).get(kind, defaults) == true;
+    }
+    function view(menu) { return active() && (manager() || permission(menu, 'view')); }
+    function edit(menu) { return active() && (manager() || (permission(menu, 'view') && permission(menu, 'edit'))); }
+    function menuFor(c) {
+      return c == 'members' ? 'team' : c == 'projects' ? 'projects'
+        : c == 'tasks' ? 'tasks' : c == 'schedules' ? 'calendar'
+        : c == 'meetings' ? 'meetings' : c == 'kpis' ? 'performance'
+        : c == 'leave' ? 'leave' : c == 'education' ? 'education'
+        : c == 'documents' ? 'documents' : c == 'monthlyWork' ? 'reports'
+        : c == 'counseling' ? 'counseling' : 'settings';
+    }
+    function recordCollection(c) {
+      return c in ['members','projects','tasks','schedules','meetings','kpis','leave','education','documents','monthlyWork','counseling'];
+    }
+    function owner(c, value) {
+      return c == 'tasks' ? value.get('assignee',null)
+        : c in ['leave','education','counseling'] ? value.get('userId',null)
+        : c in ['documents','monthlyWork'] ? value.get('author',null)
+        : value.get('owner',null);
+    }
+    function owned(c, value) {
+      return profile().get('memberId',null) != null && owner(c,value) == profile().memberId;
+    }
+    function validRecord(id) {
+      return request.resource.data.keys().hasOnly(['version','value','actorUid','updatedAt'])
+        && request.resource.data.version is string
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.value is map
+        && request.resource.data.value.id == id;
+    }
+    match /users/{uid} {
+      allow get: if request.auth != null && (request.auth.uid == uid || admin());
+      allow list: if admin();
+      allow create, update: if admin()
+        && request.resource.data.role in ['admin','leader','member']
+        && request.resource.data.enabled is bool
+        && (request.resource.data.role == 'admin' || request.resource.data.memberId is string)
+        && (uid != request.auth.uid || (request.resource.data.role == 'admin'
+          && request.resource.data.enabled == true && request.resource.data.get('locked',false) == false));
+      allow delete: if admin() && uid != request.auth.uid;
+    }
+    match /settings/{id} {
+      allow read: if active() && id in ['platformName','menuConfig','memberOrder','memberMenuPermissions'];
+      allow create, update: if (admin() || (manager() && id == 'memberOrder')) && id in ['platformName','menuConfig','memberOrder','memberMenuPermissions']
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+    }
+    match /members/{id} {
+      allow get: if active() && profile().get('memberId',null) == id;
+    }
+    match /{c}/{id} {
+      allow read: if recordCollection(c) && view(menuFor(c))
+        && (c != 'counseling' || manager());
+      allow create: if recordCollection(c) && edit(menuFor(c)) && validRecord(id)
+        && (c == 'members' ? admin() : manager() || (c != 'counseling' && owned(c,request.resource.data.value)))
+        && (c != 'leave' || manager() || request.resource.data.value.status == '신청');
+      allow update: if recordCollection(c) && edit(menuFor(c)) && validRecord(id)
+        && (c == 'members' ? admin() : manager() || (c != 'counseling' && owned(c,resource.data.value) && owned(c,request.resource.data.value)))
+        && (c != 'leave' || manager() || request.resource.data.value.status == resource.data.value.status);
+      allow delete: if recordCollection(c) && edit(menuFor(c))
+        && (c == 'members' ? admin() : manager() || (c != 'counseling' && owned(c,resource.data.value)));
+    }
+    match /auditLogs/{id} {
+      allow read: if manager();
+      allow create: if manager() && validRecord(id);
+      allow update, delete: if admin();
+    }
+    match /accountLogs/{id} {
+      allow read: if admin();
+      allow create: if admin() && validRecord(id);
+      allow update, delete: if admin();
+    }
+  }
+}

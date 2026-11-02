@@ -1,0 +1,22 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function profile() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+    function active() {
+      return request.auth != null
+        && firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
+        && profile().enabled == true && profile().get('locked',false) == false
+        && profile().role in ['admin','leader','member'];
+    }
+    match /uploads/{uid}/{file} {
+      allow read: if active();
+      allow create: if active() && request.auth.uid == uid
+        && request.resource.size <= 10 * 1024 * 1024;
+      // Files use immutable random names. Old revisions remain available to backups.
+      allow update: if false;
+      allow delete: if active() && profile().role == 'admin';
+    }
+  }
+}
