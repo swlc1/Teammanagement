@@ -17,7 +17,8 @@ async function fixture(){
   const fake=fs.readFileSync(path.join(__dirname,'browser-smoke.cjs'),'utf8').split('const fake=`')[1].split('`;\nconst server=')[0];
   const names=[...fake.matchAll(/export (?:const|function) (\w+)/g)].map(m=>m[1]);
   const sdk=vm.runInContext('(function(){'+fake.replaceAll('export ','')+';return {'+names.join(',')+'};})()',context);
-  context.__loadSdk=async()=>sdk;
+  const loadedModules=[];
+  context.__loadSdk=async(url)=>{loadedModules.push(url);return sdk;};
   const html=fs.readFileSync(path.join(root,'index.html'),'utf8');
   const script=html.slice(html.indexOf('<script>/*')+8,html.lastIndexOf('</script>\n<script src="sync-engine.js"'));
   vm.runInContext(script,context);
@@ -25,7 +26,7 @@ async function fixture(){
   vm.runInContext(fs.readFileSync(path.join(root,'sync-engine.js'),'utf8'),context);
   await vm.runInContext(fs.readFileSync(path.join(root,'firebase-backend.js'),'utf8').replaceAll('import(','__loadSdk('),context);
   const run=source=>vm.runInContext(source,context);
-  return {run,sdk,context,get};
+  return {run,sdk,context,get,loadedModules};
 }
 test('adapter uses Firebase authentication, starts empty, saves records and renders remote updates',async()=>{
   const {run,get}=await fixture();
@@ -44,7 +45,7 @@ test('adapter uses Firebase authentication, starts empty, saves records and rend
   run("state.page='tasks';render();");assert.ok(run('rendered').includes('공유 업무'));
   run("__mock.put('tasks/t1',{...__mock.records.get('tasks/t1').value,title:'원격 수정'});");
   assert.equal(run('db.tasks[0].title'),'원격 수정');assert.ok(run('rendered').includes('원격 수정'));
-  run("state.page='settings';render();");assert.ok(run('rendered').includes('Firebase 계정'));
+  run("state.page='settings';render();");assert.ok(run('rendered').includes('관리자가 팀원 계정을 생성'));
   await run('logout()');assert.equal(run('currentUser'),null);assert.equal(run('db.tasks.length'),0);
   await run("login('member@example.org','test-password')");
   assert.equal(run('currentUser.role'),'member');assert.equal(run("canPage('settings')"),false);
@@ -70,5 +71,76 @@ test('login after cached snapshots reads existing server data without rewriting 
   await run("login('admin@example.org','test-password')");
   assert.equal(run('db.tasks[0].title'),'기존 서버 업무');
   assert.equal(run("__mock.records.get('settings/platformName').version"),'existing-config');
+  await run('logout()');
+});
+test('restoring a backup without Storage skips attachments after confirmation and preserves source',async()=>{
+  const {run,sdk,context,loadedModules}=await fixture();
+  assert.equal(loadedModules.some(url=>url.includes('firebase-storage')),false);
+  sdk.uploadBytes=async()=>{throw new Error('Storage must not be used');};
+  await run("login('admin@example.org','test-password')");
+  const source={format:'TMD_BACKUP',data:{members:[{id:'u1',name:'팀원',photo:'data:image/png;base64,TEST'}],tasks:[{id:'t1',title:'복원 업무',status:'예정',progress:0,start:'2026-10-29',due:'2026-11-02'}],documents:[{id:'d1',name:'자료',fileName:'original.pdf',fileData:'data:application/pdf;base64,TEST'}],monthlyWork:[{id:'r1',title:'10월 추진업무',authoringMode:'pdf',pdfName:'report.pdf',pdfData:'data:application/pdf;base64,TEST',sections:[]}],userAccounts:[{id:'do-not-copy',passwordHash:'old-local-hash'}]}};
+  const before=JSON.stringify(source);context.sourceBackup=source;
+  const confirmations=[];context.confirm=message=>{confirmations.push(message);return true;};
+  await run('restoreDashboardBackup({target:{files:[{text:async()=>JSON.stringify(sourceBackup)}]}})');
+  assert.equal(JSON.stringify(source),before,'original file data must remain unchanged');
+  assert.ok(confirmations.some(text=>text.includes('3건')));
+  assert.equal(run("__mock.records.get('tasks/t1').value.title"),'복원 업무');
+  assert.equal(run("__mock.records.get('documents/d1').value.fileData"),undefined);
+  assert.equal(run("__mock.records.get('documents/d1').value.fileName"),'original.pdf');
+  assert.equal(run("__mock.records.get('monthlyWork/r1').value.pdfData"),undefined);
+  assert.equal(run("__mock.records.get('monthlyWork/r1').value.pdfName"),'report.pdf');
+  assert.equal(run("__mock.records.get('monthlyWork/r1').value.attachmentOmitted"),true);
+  assert.equal(run("__mock.records.has('users/do-not-copy')"),false);
+  await run('logout()');
+});
+test('canceling attachment exclusion leaves server and current data unchanged',async()=>{
+  const {run,context}=await fixture();await run("login('admin@example.org','test-password')");
+  context.sourceBackup={members:[],tasks:[{id:'new-task'}],monthlyWork:[{id:'report',authoringMode:'pdf',pdfData:'data:application/pdf;base64,TEST'}]};
+  let confirmations=0;context.confirm=()=>++confirmations===1;
+  const before=run('__mock.records.size');
+  await run('restoreDashboardBackup({target:{files:[{text:async()=>JSON.stringify(sourceBackup)}]}})');
+  assert.equal(run('__mock.records.size'),before);assert.equal(run('db.tasks.length'),0);
+  await run('logout()');
+});
+test('admin creates accounts without changing their session or storing passwords',async()=>{
+  const {run,context}=await fixture();await run("login('admin@example.org','test-password')");
+  run("__mock.put('members/u2',{id:'u2',name:'신규 팀원',role:'팀원'});");
+  context.newAccount={email:'new@example.org',name:'신규 팀원',role:'member',memberId:'u2',password:'initial-password',confirmPassword:'initial-password'};
+  await run("saveUserAccount('',newAccount)");
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(run('currentUser.uid'),'admin-uid');
+  assert.equal(run('__mock.secondary.size'),0,'temporary authentication app must be disposed');
+  const uid=run("__mock.authUsers.get('new@example.org').uid");context.newUid=uid;
+  assert.equal(run("__mock.records.get('users/'+newUid).role"),'member');
+  assert.equal(run("__mock.records.get('users/'+newUid).memberId"),'u2');
+  assert.equal(run("JSON.stringify([...__mock.records]).includes('initial-password')"),false);
+  context.editedAccount={email:'new@example.org',name:'수정 이름',role:'leader',memberId:'u2'};
+  await run('saveUserAccount(newUid,editedAccount)');
+  assert.equal(run("__mock.records.get('users/'+newUid).role"),'leader');
+  assert.equal(run("__mock.records.get('users/'+newUid).name"),'수정 이름');
+  await run('toggleUserAccount(newUid)');
+  assert.equal(run("__mock.records.get('users/'+newUid).enabled"),false);
+  await run('toggleAccountLock(newUid)');
+  assert.equal(run("__mock.records.get('users/'+newUid).locked"),true);
+  assert.equal(run('currentUser.uid'),'admin-uid');
+  await run('logout()');
+});
+test('failed profile creation rolls back the new Auth user and preserves admin login',async()=>{
+  const {run,context}=await fixture();await run("login('admin@example.org','test-password')");
+  run("__mock.put('members/u2',{id:'u2',name:'팀원',role:'팀원'});__mock.failProfileWrite=true;");
+  context.newAccount={email:'rollback@example.org',name:'팀원',role:'member',memberId:'u2',password:'initial-password',confirmPassword:'initial-password'};
+  await assert.rejects(run("saveUserAccount('',newAccount)"));
+  assert.equal(run("__mock.authUsers.has('rollback@example.org')"),false);
+  assert.equal(run('__mock.secondary.size'),0);
+  assert.equal(run('currentUser.uid'),'admin-uid');
+  await run('logout()');
+});
+test('member cannot provision accounts',async()=>{
+  const {run,context}=await fixture();
+  run("__mock.put('members/u1',{id:'u1',name:'팀원',role:'팀원'});");
+  await run("login('member@example.org','test-password')");
+  context.newAccount={email:'forbidden@example.org',name:'임의 계정',role:'admin',password:'initial-password',confirmPassword:'initial-password'};
+  await assert.rejects(run("saveUserAccount('',newAccount)"));
+  assert.equal(run('__mock.authUsers.size'),0);
   await run('logout()');
 });

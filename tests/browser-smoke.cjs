@@ -7,11 +7,11 @@ const root=path.resolve(__dirname,'..');
 const fake=`
 const records=new Map([['users/admin-uid',{name:'테스트 관리자',email:'admin@example.org',enabled:true,role:'admin'}],['users/member-uid',{name:'테스트 팀원',email:'member@example.org',enabled:true,role:'member',memberId:'u1'}]]);
 const listeners=new Set(),authListeners=new Set();let sequence=0;
-const authentication={currentUser:null};
-export const browserSessionPersistence={};
-export const initializeApp=()=>({});export const getAuth=()=>authentication;
+const authentication={currentUser:null};const secondary=new Map(),authUsers=new Map();
+export const browserSessionPersistence={};export const inMemoryPersistence={};
+export const initializeApp=(config,name)=>({name:name||"default"});export const getAuth=app=>{if(!app||app.name==="default")return authentication;if(!secondary.has(app.name))secondary.set(app.name,{currentUser:null});return secondary.get(app.name);};export const deleteApp=async app=>secondary.delete(app.name);
 export const getFirestore=()=>({});export const getStorage=()=>({});
-export const setPersistence=async()=>{};
+export const setPersistence=async(auth,persistence)=>{auth.persistence=persistence;};
 export const doc=(db,c,id)=>({key:c+'/'+id});
 export const collection=(db,c)=>({collection:c});
 export const query=(ref,...constraints)=>({...ref,constraints});
@@ -26,14 +26,16 @@ export function onSnapshot(ref,options,next,error){
  listeners.add(fire);queueMicrotask(fire);return()=>listeners.delete(fire);
 }
 export const runTransaction=async(db,body)=>{const writes=[];const tx={get:async ref=>snap(ref.key),set:(ref,value)=>writes.push([ref.key,value]),delete:ref=>writes.push([ref.key,null])};await body(tx);for(const [key,value]of writes){if(value===null)records.delete(key);else records.set(key,structuredClone(value));}notify();};
-export const setDoc=async(ref,data)=>{records.set(ref.key,{...records.get(ref.key),...data});notify();};
+export const setDoc=async(ref,data)=>{if(window.__mock.failProfileWrite&&ref.key.startsWith("users/created-"))throw {code:"permission-denied"};records.set(ref.key,{...records.get(ref.key),...data});notify();};
 export const updateDoc=setDoc;
 export const signInWithEmailAndPassword=async(auth,email,password)=>{if(password!=='test-password')throw {code:'auth/invalid-credential'};const uid=email==='admin@example.org'?'admin-uid':'member-uid';auth.currentUser={uid,email};for(const cb of authListeners)cb(auth.currentUser);return {user:auth.currentUser};};
-export const signOut=async(auth)=>{auth.currentUser=null;for(const cb of authListeners)cb(null);};
+export const signOut=async(auth)=>{auth.currentUser=null;if(auth===authentication)for(const cb of authListeners)cb(null);};
+export const createUserWithEmailAndPassword=async(auth,email,password)=>{if(authUsers.has(email))throw {code:"auth/email-already-in-use"};const user={uid:"created-"+(++sequence),email};authUsers.set(email,user);auth.currentUser=user;return {user};};
+export const deleteUser=async user=>authUsers.delete(user.email);
 export const onAuthStateChanged=(auth,cb)=>{authListeners.add(cb);queueMicrotask(()=>cb(auth.currentUser));return()=>authListeners.delete(cb);};
 export const sendPasswordResetEmail=async()=>{};
 export const ref=(storage,key)=>({key});export const uploadBytes=async()=>{};export const getDownloadURL=async(ref)=>'https://example.org/'+ref.key;export const getBlob=async()=>new Blob(['test']);
-window.__mock={records,notify,put:(key,value)=>{records.set(key,{version:'remote-'+(++sequence),value});notify();}};
+window.__mock={records,notify,authUsers,secondary,put:(key,value)=>{records.set(key,{version:'remote-'+(++sequence),value});notify();}};
 `;
 const server=http.createServer((req,res)=>{
  res.setHeader('Access-Control-Allow-Origin','*');
@@ -67,9 +69,9 @@ const server=http.createServer((req,res)=>{
   await page.evaluate(()=>{const record=window.__mock.records.get('tasks/t1');window.__mock.put('tasks/t1',{...record.value,title:'다른 PC에서 수정'});});
   await page.waitForFunction(()=>db.tasks.some(t=>t.title==='다른 PC에서 수정'));
   await page.evaluate(()=>go('settings'));
-  assert.ok((await page.locator('body').innerText()).includes('Firebase 계정'));
+  assert.ok((await page.locator('body').innerText()).includes('관리자가 팀원 계정을 생성'));
   await page.evaluate(()=>openAccountEditor('','u1'));
-  await page.waitForSelector('#firebaseUid');assert.equal(await page.locator('#accountPassword').count(),0);await page.evaluate(()=>closeModal());
+  await page.waitForSelector('#firebasePassword');assert.equal(await page.locator('#firebaseUid').count(),0);await page.evaluate(()=>closeModal());
   await page.evaluate(()=>logout());await page.waitForFunction(()=>currentUser===null);
   assert.equal(await page.evaluate(()=>db.tasks.length),0,'logout clears server data from memory');
   await page.fill('#loginId','member@example.org');await page.fill('#loginPw','test-password');await page.click('#loginForm [type=submit]');
