@@ -6,7 +6,7 @@ const path=require('node:path');
 const {webcrypto}=require('node:crypto');
 const root=path.resolve(__dirname,'..');
 function element(){
-  return {style:{},dataset:{},value:'',textContent:'',innerHTML:'',children:[],childNodes:[],classList:{add(){},remove(){},toggle(){},contains(){return false;}},setAttribute(){},append(el){this.children.push(el);},appendChild(el){this.children.push(el);return el;},replaceChildren(){this.children=[];},querySelector(){return element();},querySelectorAll(){return [];},closest(){return null;},remove(){},focus(){},click(){},addEventListener(){}};
+  return {style:{},dataset:{},value:'',textContent:'',innerHTML:'',children:[],childNodes:[],classList:{add(){},remove(){},toggle(){},contains(){return false;}},setAttribute(){},append(el){this.children.push(el);},appendChild(el){this.children.push(el);return el;},insertBefore(el,before){const index=this.children.indexOf(before);if(index<0)this.children.push(el);else this.children.splice(index,0,el);return el;},replaceChildren(){this.children=[];},querySelector(){return element();},querySelectorAll(){return [];},closest(){return null;},remove(){},focus(){},click(){},addEventListener(){}};
 }
 async function fixture(options={}){
   const nodes=new Map();const get=s=>{if(!nodes.has(s))nodes.set(s,element());return nodes.get(s);};
@@ -221,4 +221,39 @@ test('a large remote snapshot renders once instead of once per record',async()=>
   assert.equal(run('db.tasks.length'),100);
   assert.equal(run('renderCount')-before,1);
   await run('logout()');
+});
+for(const role of ['leader','member'])test(role+' can change only their own password after verifying the current password',async()=>{
+  const {run,get}=await fixture();
+  run("__mock.records.get('users/member-uid').role='"+role+"';__mock.put('members/u1',{id:'u1',name:'테스트 팀원',role:'팀원'});");
+  await run("login('member@example.org','test-password')");
+  assert.equal(run('currentUser.role'),role);
+  const footer=get('.sidebar-footer');
+  assert.ok(footer.children.some(node=>node.id==='sidebarPasswordBtn'));
+  const status=footer.children.find(node=>node.id==='firebaseStatus');
+  assert.ok(status.style.cssText.includes('position:static'));
+  assert.equal(status.style.cssText.includes('position:fixed'),false);
+  run('openOwnPasswordChange()');
+  get('#ownPasswordCurrent').value='test-password';get('#ownPasswordNew').value='new-own-password';get('#ownPasswordConfirm').value='new-own-password';
+  await get('#ownPasswordSave').onclick();
+  assert.equal(run("__mock.reauthCalls[0]"),'member-uid');
+  assert.equal(run("__mock.passwordUpdates[0]"),'member-uid');
+  assert.equal(run("JSON.stringify([...__mock.records]).includes('new-own-password')"),false);
+  assert.equal(get('#ownPasswordCurrent').value,'');
+  assert.equal(get('#ownPasswordNew').value,'');
+  assert.equal(run('currentUser.uid'),'member-uid');
+  await run('logout()');assert.equal(status.hidden,true);
+});
+test('wrong current password and invalid confirmation cannot change a password',async()=>{
+  const {run,get}=await fixture();await run("login('admin@example.org','test-password')");
+  await assert.rejects(run("changeOwnPassword('test-password','new-pass-long','not-matching')"));
+  await assert.rejects(run("changeOwnPassword('test-password','short','short')"));
+  await assert.rejects(run("changeOwnPassword('test-password','test-password','test-password')"));
+  assert.equal(run('__mock.reauthCalls.length'),0);
+  run('openOwnPasswordChange()');get('#ownPasswordCurrent').value='wrong-password';get('#ownPasswordNew').value='new-pass-long';get('#ownPasswordConfirm').value='new-pass-long';
+  await get('#ownPasswordSave').onclick();
+  assert.ok(get('#ownPasswordError').textContent.includes('현재 비밀번호'));
+  assert.equal(run('__mock.passwordUpdates.length'),0);
+  assert.equal(get('#ownPasswordSave').disabled,false);
+  await run('logout()');
+  await assert.rejects(run("changeOwnPassword('test-password','new-pass-long','new-pass-long')"));
 });
