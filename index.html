@@ -2686,7 +2686,7 @@ textarea.input{line-height:1.65}
       </div>
       <label>아이디<input class="input" id="loginId" autocomplete="username" ></label>
       <label>비밀번호<input class="input" id="loginPw" type="password" autocomplete="current-password" ></label>
-      <label class="remember-row login-policy"><span>보안정책</span> 브라우저를 다시 열거나 새로고침하면 재로그인이 필요합니다.</label>
+      <label class="remember-row login-policy"><span>보안정책</span> 브라우저 세션 동안 로그인 상태가 유지됩니다.</label>
       <button class="login-submit" type="submit">로그인</button>
       <div class="login-error" id="loginError"></div><button class="login-repair" type="button" onclick="repairStoredData()">저장 데이터 복구</button>
     </form>
@@ -2732,7 +2732,7 @@ textarea.input{line-height:1.65}
 
 /* V5.1 Standalone HTML Edition - local login + localStorage */
 const $=(s,r=document)=>r.querySelector(s); const $$=(s,r=document)=>[...r.querySelectorAll(s)];
-const TODAY='2026-08-13';
+const TODAY=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Seoul',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 const navGroups=[
  {title:'1. 업무관리',items:[['tasks','✓','전체 업무'],['projects','▦','사업·프로젝트'],['calendar','▣','일정관리'],['workload','♟','팀원 업무현황']]},
  {title:'2. 성과·보고',items:[['performance','◎','성과관리'],['meetings','☷','회의관리'],['reports','▤','월 추진업무'],['analytics','◫','통계·분석']]},
@@ -2951,68 +2951,7 @@ async function createAccountRecord({id,username,password,role,roleLabel,memberId
     failedAttempts:0,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),lastLoginAt:null
   };
 }
-async function ensureAccountData(){
-  db.userAccounts=Array.isArray(db.userAccounts)?db.userAccounts:[];
-  db.accountLogs=Array.isArray(db.accountLogs)?db.accountLogs:[];
-  const namedLeader=db.members.find(m=>m.name==='이재성');
-  const leader=db.members.find(m=>m.role==='팀장')||namedLeader||db.members[0];
-  if(namedLeader&&!(db.members||[]).some(m=>m.role==='팀장')){
-    namedLeader.role='팀장';namedLeader.position=namedLeader.position||'팀장';
-  }
-  const teamMembers=db.members.filter(m=>m.id!==leader?.id);
-
-  if(!db.userAccounts.some(a=>a.role==='admin')){
-    db.userAccounts.push(await createAccountRecord({id:'acc-admin',username:'admin',password:'admin123',role:'admin',roleLabel:'시스템 관리자'}));
-  }
-
-  // 현재 팀장 계정. 기존 leader 로그인 호환
-  if(leader){
-    let la=db.userAccounts.find(a=>a.memberId===leader.id);
-    if(!la){
-      const username=db.userAccounts.some(a=>a.username.toLowerCase()==='leader')?`leader_${leader.id}`:'leader';
-      la=await createAccountRecord({id:'acc-'+leader.id,username,password:'leader123',role:'leader',roleLabel:'팀장',memberId:leader.id});
-      db.userAccounts.push(la);
-    }
-  }
-
-  // 모든 팀원에게 고유 로그인 계정 생성. 첫 팀원은 기존 member/member123 호환
-  for(let i=0;i<teamMembers.length;i++){
-    const m=teamMembers[i];
-    let acc=db.userAccounts.find(a=>a.memberId===m.id);
-    if(!acc){
-      let username=i===0?'member':`member${i+1}`;
-      let n=2;
-      while(db.userAccounts.some(a=>a.username.toLowerCase()===username.toLowerCase()))username=`member${i+1}_${n++}`;
-      acc=await createAccountRecord({id:'acc-'+m.id,username,password:'member123',role:'member',roleLabel:'팀원',memberId:m.id,mustReset:i>0});
-      db.userAccounts.push(acc);
-    }
-  }
-
-  // 고정 로그인 별칭 정합성: leader=현재 팀장, member2=장주훈
-  if(leader){
-    const leaderAcc=db.userAccounts.find(a=>a.memberId===leader.id);
-    const conflictingLeader=db.userAccounts.find(a=>a.username?.toLowerCase()==='leader'&&a.memberId!==leader.id);
-    if(conflictingLeader)conflictingLeader.username=`member_${conflictingLeader.memberId||conflictingLeader.id}`;
-    if(leaderAcc)leaderAcc.username='leader';
-  }
-  const jang=db.members.find(m=>m.name==='장주훈');
-  if(jang){
-    const jangAcc=db.userAccounts.find(a=>a.memberId===jang.id);
-    const conflictingMember2=db.userAccounts.find(a=>a.username?.toLowerCase()==='member2'&&a.memberId!==jang.id);
-    if(conflictingMember2)conflictingMember2.username=`member_${conflictingMember2.memberId||conflictingMember2.id}`;
-    if(jangAcc)jangAcc.username='member2';
-  }
-
-  // 팀장 변경 시 연결 계정의 역할도 자동 동기화
-  db.userAccounts.forEach(a=>{
-    if(a.role==='admin'||!a.memberId)return;
-    const m=db.members.find(x=>x.id===a.memberId);
-    if(!m)return;
-    const rr=accountRoleForMember(m);
-    a.role=rr.role;a.roleLabel=rr.roleLabel;a.updatedAt=a.updatedAt||new Date().toISOString();
-  });
-  save();
-}
+async function ensureAccountData(){} // Firebase adapter supplies account metadata.
 function accountByMember(memberId){return (db.userAccounts||[]).find(a=>a.memberId===memberId);}
 function accountById(id){return (db.userAccounts||[]).find(a=>a.id===id);}
 function accountStatusLabel(a){
@@ -3028,11 +2967,7 @@ function accountStatusClass(a){
   return 'active';
 }
 
-const AUTH_USERS=[
- {id:'admin',password:'admin123',role:'admin',roleLabel:'시스템 관리자'},
- {id:'leader',password:'leader123',role:'leader',roleLabel:'팀장'},
- {id:'member',password:'member123',role:'member',roleLabel:'팀원'}
-];
+const AUTH_USERS=[]; // Firebase Authentication owns credentials.
 const ROLE_PAGES={
  admin:['home','tasks','projects','calendar','workload','performance','meetings','reports','analytics','team','leave','education','counseling','evaluation','achievements','documents','references','templates','search','notifications','settings'],
  leader:['home','tasks','projects','calendar','workload','performance','meetings','reports','analytics','team','leave','education','counseling','evaluation','achievements','documents','references','templates','search','notifications'],
@@ -3095,35 +3030,7 @@ function resolveLoginUser(base){
   const rr=accountRoleForMember(m);
   return {id:base.username,accountId:base.id,role:rr.role,roleLabel:rr.roleLabel,name:m?.name||rr.roleLabel,memberId:m?.id||null};
 }
-async function login(id,pw){
-  ensureV3Data();
-  await ensureAccountData();
-  const username=(id||'').trim().toLowerCase();
-  const account=(db.userAccounts||[]).find(a=>(a.username||'').toLowerCase()===username);
-  if(!account)return false;
-  if(!account.enabled)throw new Error('ACCOUNT_DISABLED');
-  if(account.locked)throw new Error('ACCOUNT_LOCKED');
-  const candidate=await hashPassword(pw||'',account.passwordSalt);
-  if(candidate!==account.passwordHash){
-    account.failedAttempts=(account.failedAttempts||0)+1;
-    if(account.failedAttempts>=5){
-      account.locked=true;
-      accountLog('자동잠금',account,'로그인 5회 실패');
-    }else save();
-    return false;
-  }
-  account.failedAttempts=0;
-  account.lastLoginAt=new Date().toISOString();
-  account.updatedAt=new Date().toISOString();
-  currentUser=resolveLoginUser(account);
-  safeStorageSet('tmd-session',JSON.stringify(currentUser),'session');
-  const login=$('#loginScreen'),shell=$('#appShell');
-  if(login){login.classList.add('hidden');login.style.display='none';}
-  if(shell){shell.classList.remove('locked');shell.style.pointerEvents='';shell.style.filter='';}
-  state.page='home';renderNav();render();$('#breadcrumb').textContent='홈 대시보드';
-  $('#platformName')&&($('#platformName').textContent=(db.platformName||'Team Management Dashboard').replace(' Dashboard',''));
-  updateSessionUI();audit('로그인','시스템',currentUser.name);accountLog('로그인',account,'정상 로그인');save();return true;
-}
+async function login(){throw new Error('FIREBASE_NOT_READY');}
 function logout(){
   try{audit('로그아웃','시스템','')}catch(e){}
   safeStorageRemove('tmd-session');
@@ -4496,7 +4403,7 @@ function renderDocuments(){
   return pageHead('업무자료','사업 → 업무 → 자료 구조로 연결되는 팀 업무자료 저장소입니다.',canManage()?'<button class="primary-btn" data-add="document">＋ 자료등록</button>':'')+
   `<div class="toolbar"><input class="input" placeholder="자료명·키워드 검색"><select class="select"><option>전체 유형</option><option>사업계획</option><option>결과보고</option><option>회의자료</option></select></div>
   <div class="table-wrap"><table class="data-table"><thead><tr><th>자료명</th><th>유형</th><th>관련사업</th><th>작성자</th><th>작성일</th><th>버전</th><th>첨부파일</th><th>관리</th></tr></thead><tbody>
-  ${db.documents.map(x=>`<tr><td><b>${x.name}</b></td><td>${x.type}</td><td>${projectOf(x.projectId)}</td><td>${nameOf(x.author)}</td><td>${formatDate(x.date)}</td><td><span class="badge blue">${x.version}</span></td><td>${x.fileData?`<button class="file-download-btn" data-download-doc="${x.id}">📎 ${x.fileName||'첨부파일'}</button>`:'<span class="no-file">-</span>'}</td><td>${actionButtons('document',x.id,x.author)}</td></tr>`).join('')}
+  ${db.documents.map(x=>`<tr><td><b>${x.name}</b></td><td>${x.type}</td><td>${projectOf(x.projectId)}</td><td>${nameOf(x.author)}</td><td>${formatDate(x.date)}</td><td><span class="badge blue">${x.version}</span></td><td>${(x.filePath||x.fileData)?`<button class="file-download-btn" data-download-doc="${x.id}">📎 ${x.fileName||'첨부파일'}</button>`:'<span class="no-file">-</span>'}</td><td>${actionButtons('document',x.id,x.author)}</td></tr>`).join('')}
   </tbody></table></div>`;
 }
 function renderPermissionMatrix(memberId){
@@ -4988,7 +4895,7 @@ function openForm(type,existing=null){
     submit=`saveSchedule('${e.id||''}')`
   }
   if(type==='member'){
-    window.pendingPhotoData=e.photo||'';
+    window.pendingPhotoData=e.photo||'';window.pendingPhotoRemoved=false;
     title=existing?'팀원정보 수정':'팀원 등록';
     body=`<div class="profile-editor"><div id="photoPreview">${e.photo?`<div class="profile-photo-preview"><img src="${e.photo}"></div>`:`<div class="profile-photo-preview fallback">${e.name?.[0]||'+'}</div>`}</div><div class="photo-actions"><label class="secondary-btn file-btn">사진 추가/변경<input type="file" id="f-photo" accept="image/*" onchange="previewMemberPhoto(event)"></label><button type="button" class="danger-text-btn" onclick="removePendingPhoto()">사진 삭제</button></div></div>
     <div class="form-grid">
@@ -5085,7 +4992,7 @@ function openForm(type,existing=null){
     submit=`saveMonthlyWork('${e.id||''}')`
   }
   if(type==='document'){
-    window.pendingDocumentFileData=e.fileData||null;
+    window.pendingDocumentFileData=e.fileData||null;window.pendingDocumentFileRemoved=false;
     window.pendingDocumentFileName=e.fileName||'';
     window.pendingDocumentFileType=e.fileType||'';
     title=existing?'자료 수정':'자료 등록';
@@ -5138,7 +5045,7 @@ function previewMemberPhoto(ev){
   if(f.size>1500000){toast('Prototype 저장공간을 위해 1.5MB 이하 이미지를 사용해주세요.');ev.target.value='';return}
   const r=new FileReader();r.onload=()=>{window.pendingPhotoData=r.result;$('#photoPreview').innerHTML=`<div class="profile-photo-preview"><img src="${r.result}"></div>`};r.readAsDataURL(f);
 }
-function removePendingPhoto(){window.pendingPhotoData='';$('#photoPreview').innerHTML='<div class="profile-photo-preview fallback">+</div>';toast('저장 시 사진이 삭제됩니다.');}
+function removePendingPhoto(){window.pendingPhotoRemoved=true;window.pendingPhotoData='';$('#photoPreview').innerHTML='<div class="profile-photo-preview fallback">+</div>';toast('저장 시 사진이 삭제됩니다.');}
 
 function saveTask(id=''){
   const old=db.tasks.find(x=>x.id===id);
@@ -5267,7 +5174,7 @@ function saveMember(id=''){
   closeModal();render();
   toast(selectedRole==='팀장'?'팀장 권한과 로그인 사용자가 함께 변경되었습니다.':(old?'팀원정보가 수정되었습니다.':'팀원이 등록되었습니다.'));
 }
-function saveLeave(id=''){const old=db.leave.find(x=>x.id===id),obj={id:id||'l'+Date.now(),userId:$('#f-user').value,type:$('#f-type').value,start:$('#f-start').value,end:$('#f-end').value,days:$('#f-type').value.includes('반차')?.5:1,reason:$('#f-reason').value,status:old?.status||'승인'};if(old)Object.assign(old,obj);else db.leave.push(obj);save();audit(old?'수정':'등록','휴가·근태',nameOf(obj.userId));closeModal();render();toast(old?'휴가정보가 수정되었습니다.':'휴가가 등록되었습니다.')}
+function saveLeave(id=''){const old=db.leave.find(x=>x.id===id),obj={id:id||'l'+Date.now(),userId:$('#f-user').value,type:$('#f-type').value,start:$('#f-start').value,end:$('#f-end').value,days:$('#f-type').value.includes('반차')?.5:1,reason:$('#f-reason').value,status:old?.status||(currentUser?.role==='member'?'신청':'승인')};if(old)Object.assign(old,obj);else db.leave.push(obj);save();audit(old?'수정':'등록','휴가·근태',nameOf(obj.userId));closeModal();render();toast(old?'휴가정보가 수정되었습니다.':'휴가가 등록되었습니다.')}
 function saveEducation(id=''){
   const old=db.education.find(x=>x.id===id);
   if(old && !canEditRecord(old.userId)) return toast('본인의 교육이력만 편집할 수 있습니다.');
@@ -5342,6 +5249,7 @@ function previewDocumentFile(ev){
   r.readAsDataURL(f);
 }
 function removeDocumentFile(){
+  window.pendingDocumentFileRemoved=true;
   window.pendingDocumentFileData=null; window.pendingDocumentFileName=''; window.pendingDocumentFileType='';
   const box=$('#documentFileState'); if(box)box.innerHTML='<span class="no-file">첨부된 파일 없음</span>';
 }
@@ -5625,9 +5533,10 @@ async function bootApp(){
     if(error) error.textContent='초기화 오류가 발생했습니다. 새로고침 후 다시 시도해주세요.';
   }
 }
-if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',bootApp);
-else bootApp();
+// firebase-backend.js starts the application after Firebase has loaded.
 
 </script>
+<script src="sync-engine.js"></script>
+<script src="firebase-backend.js"></script>
 </body>
 </html>
